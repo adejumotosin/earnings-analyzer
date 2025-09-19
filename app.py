@@ -43,54 +43,92 @@ def format_currency(value):
 
 # --- Data Fetching Functions ---
 # 1️⃣ SEC EDGAR Earnings Scraper
+import requests
+import os
+import streamlit as st
+from datetime import datetime
+
 @st.cache_data(ttl=3600, show_spinner="📋 Fetching SEC filings...")
 def fetch_sec_earnings(ticker, quarters=4):
     """
-    Fetch recent financial data by combining CIK lookup from sec-api.io
-    with detailed financial data from SEC's XBRL APIs.
+    Fetch recent financial data by combining CIK lookup and filing search
+    with a dedicated financial statements API from sec-api.io.
     """
     filings_data = []
 
-    # Check for the sec-api.io API key
     api_key = st.secrets.get("SEC_API_KEY") or os.environ.get("SEC_API_KEY")
     if not api_key:
         st.error("❌ Missing SEC API key. Please set it in your Streamlit secrets.")
         return []
     
-    # Use sec-api.io's financial statements API to get structured data
+    # Step 1: Use the Query API to find the most recent 10-Q and 10-K filings
+    query_url = "https://api.sec-api.io/query"
+    payload = {
+        "query": f"ticker:{ticker} AND formType:(\"10-Q\" OR \"10-K\")",
+        "from": "0",
+        "size": quarters,
+        "sort": [{"filedAt": {"order": "desc"}}]
+    }
+    headers = {"Content-Type": "application/json"}
+    
     try:
-        url = f"https://api.sec-api.io/financial-statements?ticker={ticker}&statement=income&limit={quarters}&token={api_key}"
-        response = requests.get(url)
-        response.raise_for_status()
-        statements = response.json()
+        query_response = requests.post(
+            query_url, json=payload, headers=headers, params={"token": api_key}
+        )
+        query_response.raise_for_status()
+        filings = query_response.json().get("filings", [])
     except requests.exceptions.RequestException as e:
-        st.error(f"❌ Failed to fetch financial statements from sec-api.io: {e}")
+        st.error(f"❌ Failed to fetch filing URLs from sec-api.io: {e}")
+        return []
+    
+    if not filings:
+        st.info(f"No 10-Q or 10-K filings found for {ticker}.")
         return []
 
-    if not statements:
-        st.info(f"No financial statements found for {ticker}.")
-        return []
-
-    for stmt in statements:
+    # Step 2: For each filing, use the XBRL-to-JSON Converter API
+    for filing in filings:
+        filing_url = filing.get("linkToFilingDetails")
+        if not filing_url:
+            continue
+            
+        xbrl_url = "https://api.sec-api.io/xbrl-to-json"
+        
         try:
-            # Extract relevant financial metrics
-            revenue = next(item['value'] for item in stmt['statementOfIncome'] if item['concept'] == 'Revenues')
-            net_income = next(item['value'] for item in stmt['statementOfIncome'] if item['concept'] == 'NetIncomeLoss')
-            # Note: EPS is more complex to parse and may not be in the income statement directly,
-            # so we'll leave it as None for this simplified patch. A more robust solution
-            # would require parsing the 'per_share' statement.
+            xbrl_response = requests.get(
+                xbrl_url, params={"url": filing_url, "token": api_key}
+            )
+            xbrl_response.raise_for_status()
+            data = xbrl_response.json()
+            
+            # The API returns a list of income statements, we take the last one
+            income_statements = data.get("incomeStatement", [])
+            if not income_statements:
+                continue
+                
+            last_statement = income_statements[-1]
+
+            revenue = None
+            net_income = None
             eps = None
             
+            for fact in last_statement:
+                if fact.get("concept") == "Revenues":
+                    revenue = fact.get("value")
+                elif fact.get("concept") == "NetIncomeLoss":
+                    net_income = fact.get("value")
+                elif fact.get("concept") == "EarningsPerShareDiluted":
+                    eps = fact.get("value")
+            
             filings_data.append({
-                'date': stmt['periodOfReport'],
-                'type': stmt['formType'],
+                'date': filing.get("filedAt"),
+                'type': filing.get("formType"),
                 'revenue': revenue,
                 'eps': eps,
                 'net_income': net_income
             })
-        except (KeyError, StopIteration) as e:
-            # Handle cases where a specific key is missing
-            st.warning(f"⚠️ Could not parse all data for a filing: {e}")
+
+        except requests.exceptions.RequestException as e:
+            st.warning(f"⚠️ Failed to process a filing: {e}")
             continue
 
     return filings_data
