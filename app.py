@@ -42,11 +42,6 @@ def format_currency(value):
     return value
 
 # --- Data Fetching Functions ---
-import requests
-import os
-import streamlit as st
-from datetime import datetime
-
 @st.cache_data(ttl=3600, show_spinner="📋 Fetching SEC filings...")
 def fetch_sec_earnings(ticker, quarters=4):
     """
@@ -89,15 +84,15 @@ def fetch_sec_earnings(ticker, quarters=4):
 
     # Step 2: For each filing, use the XBRL-to-JSON Converter API
     for filing in filings:
-        accession_no = filing.get("accessionNo")
-        if not accession_no:
+        filing_url = filing.get("linkToFilingDetails")
+        if not filing_url:
             continue
             
-        xbrl_api_url = "https://api.sec-api.io/xbrl-to-json"
+        xbrl_url = "https://api.sec-api.io/xbrl-to-json"
         
         try:
             xbrl_response = requests.get(
-                xbrl_api_url, params={"accessionNo": accession_no, "token": api_key}
+                xbrl_url, params={"url": filing_url}, headers={"Authorization": api_key}
             )
             xbrl_response.raise_for_status()
             data = xbrl_response.json()
