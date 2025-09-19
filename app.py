@@ -89,15 +89,15 @@ def fetch_sec_earnings(ticker, quarters=4):
 
     # Step 2: For each filing, use the XBRL-to-JSON Converter API
     for filing in filings:
-        filing_url = filing.get("linkToFilingDetails")
-        if not filing_url:
+        accession_no = filing.get("accessionNo")
+        if not accession_no:
             continue
             
-        xbrl_url = "https://api.sec-api.io/xbrl-to-json"
+        xbrl_api_url = "https://api.sec-api.io/xbrl-to-json"
         
         try:
             xbrl_response = requests.get(
-                xbrl_url, params={"url": filing_url, "token": api_key}
+                xbrl_api_url, params={"accessionNo": accession_no, "token": api_key}
             )
             xbrl_response.raise_for_status()
             data = xbrl_response.json()
