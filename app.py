@@ -61,7 +61,7 @@ def fetch_sec_earnings(ticker, quarters=4):
         return []
     
     # Step 1: Use the Query API to find the most recent 10-Q and 10-K filings
-    query_url = "https://api.sec-api.io/query"
+    query_url = "https://api.sec-api.io"
     payload = {
         "query": f"ticker:{ticker} AND formType:(\"10-Q\" OR \"10-K\")",
         "from": "0",
