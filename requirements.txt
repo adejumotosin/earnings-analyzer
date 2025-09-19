@@ -1,7 +1,6 @@
-streamlit>=1.28.0
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-pandas>=2.0.0
-google-generativeai>=0.3.0
-yfinance>=0.2.0
-plotly>=5.15.0
+streamlit
+requests
+pandas
+google-generativeai
+yfinance
+beautifulsoup4
