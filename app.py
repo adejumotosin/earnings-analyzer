@@ -57,98 +57,44 @@ def fetch_sec_earnings(ticker, quarters=4):
         st.error("❌ Missing SEC API key. Please set it in your Streamlit secrets.")
         return []
     
-    # 1. Look up CIK using the sec-api.io Mapping API (more reliable)
+    # Use sec-api.io's financial statements API to get structured data
     try:
-        mapping_url = f"https://api.sec-api.io/mapping/ticker/{ticker}?token={api_key}"
-        response = requests.get(mapping_url)
+        url = f"https://api.sec-api.io/financial-statements?ticker={ticker}&statement=income&limit={quarters}&token={api_key}"
+        response = requests.get(url)
         response.raise_for_status()
-        ticker_data = response.json()
-        
-        if not ticker_data or not isinstance(ticker_data, list) or not ticker_data[0].get("cik"):
-            st.warning(f"⚠️ CIK for {ticker} not found via sec-api.io.")
-            return []
-            
-        cik = str(ticker_data[0].get("cik"))
-            
+        statements = response.json()
     except requests.exceptions.RequestException as e:
-        st.error(f"❌ Failed to fetch CIK for {ticker} from sec-api.io: {e}")
-        return []
-    except json.JSONDecodeError:
-        st.error("❌ Failed to decode JSON from sec-api.io. Please check your API key.")
+        st.error(f"❌ Failed to fetch financial statements from sec-api.io: {e}")
         return []
 
-    # 2. Get company facts using the SEC's public XBRL API
-    try:
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        headers = {'User-Agent': 'Financial Analyzer App/1.0 (info@example.com)'}
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        company_facts = response.json()
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            st.error("❌ You have hit the SEC's rate limit (429 Too Many Requests). Please wait a few minutes before trying again.")
-        else:
-            st.error(f"❌ Failed to fetch company facts for CIK {cik}: {e}")
-        return []
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ Failed to fetch company facts for CIK {cik}: {e}")
-        return []
-    except json.JSONDecodeError:
-        st.error("❌ Failed to decode JSON from SEC company facts API. The SEC may have returned a non-JSON response due to rate limiting. Please try again in a few minutes.")
+    if not statements:
+        st.info(f"No financial statements found for {ticker}.")
         return []
 
-    # 3. Extract and parse relevant financial data
-    try:
-        us_gaap_data = company_facts.get('facts', {}).get('us-gaap', {})
-        
-        # Get financial metrics from the SEC data
-        revenue_facts = us_gaap_data.get('Revenues', {}).get('units', {}).get('USD', [])
-        eps_facts = us_gaap_data.get('EarningsPerShareDiluted', {}).get('units', {}).get('USD-per-share', [])
-        net_income_facts = us_gaap_data.get('NetIncomeLoss', {}).get('units', {}).get('USD', [])
-        
-        # Sort facts by end date to get the most recent ones
-        all_facts = sorted(
-            [f for f in revenue_facts + eps_facts + net_income_facts if f.get('form') in ['10-Q', '10-K']],
-            key=lambda x: datetime.strptime(x['end'], '%Y-%m-%d'),
-            reverse=True
-        )
-
-        seen_periods = set()
-        for fact in all_facts:
-            period_end = fact.get('end')
-            form_type = fact.get('form')
+    for stmt in statements:
+        try:
+            # Extract relevant financial metrics
+            revenue = next(item['value'] for item in stmt['statementOfIncome'] if item['concept'] == 'Revenues')
+            net_income = next(item['value'] for item in stmt['statementOfIncome'] if item['concept'] == 'NetIncomeLoss')
+            # Note: EPS is more complex to parse and may not be in the income statement directly,
+            # so we'll leave it as None for this simplified patch. A more robust solution
+            # would require parsing the 'per_share' statement.
+            eps = None
             
-            if period_end not in seen_periods and len(filings_data) < quarters:
-                filing = {
-                    'date': period_end,
-                    'type': form_type,
-                    'revenue': None,
-                    'eps': None,
-                    'net_income': None
-                }
-                
-                # Find matching revenue, EPS, and net income for this period
-                for rev_fact in revenue_facts:
-                    if rev_fact.get('end') == period_end and rev_fact.get('val') is not None:
-                        filing['revenue'] = rev_fact.get('val')
-                        break
-                for eps_fact in eps_facts:
-                    if eps_fact.get('end') == period_end and eps_fact.get('val') is not None:
-                        filing['eps'] = eps_fact.get('val')
-                        break
-                for ni_fact in net_income_facts:
-                    if ni_fact.get('end') == period_end and ni_fact.get('val') is not None:
-                        filing['net_income'] = ni_fact.get('val')
-                        break
-                
-                filings_data.append(filing)
-                seen_periods.add(period_end)
-    
-    except Exception as e:
-        st.error(f"⚠️ Error parsing financial data for {ticker}: {e}")
-        return []
+            filings_data.append({
+                'date': stmt['periodOfReport'],
+                'type': stmt['formType'],
+                'revenue': revenue,
+                'eps': eps,
+                'net_income': net_income
+            })
+        except (KeyError, StopIteration) as e:
+            # Handle cases where a specific key is missing
+            st.warning(f"⚠️ Could not parse all data for a filing: {e}")
+            continue
 
     return filings_data
+
 
 # 2️⃣ Earnings Call Transcript Scraper (Simulated)
 @st.cache_data(ttl=3600, show_spinner="🎙️ Fetching earnings call transcripts...")
