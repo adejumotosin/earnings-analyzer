@@ -4,3 +4,6 @@ pandas
 google-generativeai
 yfinance
 beautifulsoup4
+requests
+streamlit
+sec-api
