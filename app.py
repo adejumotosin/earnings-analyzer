@@ -61,7 +61,7 @@ def fetch_sec_earnings(ticker, quarters=4):
         ticker_data = response.json()
         
         if not isinstance(ticker_data, list):
-            st.error("❌ SEC API returned unexpected data format for ticker lookup.")
+            st.error("❌ SEC API returned unexpected data format for ticker lookup. This may be due to temporary network issues or SEC rate limiting. Please try again in a few minutes.")
             return []
 
         cik = None
@@ -74,11 +74,17 @@ def fetch_sec_earnings(ticker, quarters=4):
             st.warning(f"⚠️ CIK for {ticker} not found.")
             return []
             
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            st.error("❌ You have hit the SEC's rate limit (429 Too Many Requests). Please wait a few minutes before trying again.")
+        else:
+            st.error(f"❌ Failed to fetch CIK for {ticker}: {e}")
+        return []
     except requests.exceptions.RequestException as e:
         st.error(f"❌ Failed to fetch CIK for {ticker}: {e}")
         return []
     except json.JSONDecodeError:
-        st.error("❌ Failed to decode JSON from SEC ticker lookup API.")
+        st.error("❌ Failed to decode JSON from SEC ticker lookup API. The SEC may have returned a non-JSON response due to rate limiting. Please try again in a few minutes.")
         return []
 
     # 2. Get company facts using the XBRL API
@@ -88,11 +94,17 @@ def fetch_sec_earnings(ticker, quarters=4):
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         company_facts = response.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            st.error("❌ You have hit the SEC's rate limit (429 Too Many Requests). Please wait a few minutes before trying again.")
+        else:
+            st.error(f"❌ Failed to fetch company facts for CIK {cik}: {e}")
+        return []
     except requests.exceptions.RequestException as e:
         st.error(f"❌ Failed to fetch company facts for CIK {cik}: {e}")
         return []
     except json.JSONDecodeError:
-        st.error("❌ Failed to decode JSON from SEC company facts API.")
+        st.error("❌ Failed to decode JSON from SEC company facts API. The SEC may have returned a non-JSON response due to rate limiting. Please try again in a few minutes.")
         return []
 
     # 3. Extract and parse relevant financial data
