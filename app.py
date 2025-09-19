@@ -42,7 +42,6 @@ def format_currency(value):
     return value
 
 # --- Data Fetching Functions ---
-# 1️⃣ SEC EDGAR Earnings Scraper
 import requests
 import os
 import streamlit as st
@@ -132,6 +131,7 @@ def fetch_sec_earnings(ticker, quarters=4):
             continue
 
     return filings_data
+
 
 
 # 2️⃣ Earnings Call Transcript Scraper (Simulated)
