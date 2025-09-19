@@ -68,11 +68,14 @@ def fetch_sec_earnings(ticker, quarters=4):
         "size": quarters,
         "sort": [{"filedAt": {"order": "desc"}}]
     }
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": api_key
+    }
     
     try:
         query_response = requests.post(
-            query_url, json=payload, headers=headers, params={"token": api_key}
+            query_url, json=payload, headers=headers
         )
         query_response.raise_for_status()
         filings = query_response.json().get("filings", [])
@@ -131,8 +134,6 @@ def fetch_sec_earnings(ticker, quarters=4):
             continue
 
     return filings_data
-
-
 
 # 2️⃣ Earnings Call Transcript Scraper (Simulated)
 @st.cache_data(ttl=3600, show_spinner="🎙️ Fetching earnings call transcripts...")
