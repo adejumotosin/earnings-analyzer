@@ -47,26 +47,25 @@ def format_currency(value):
 @st.cache_data(ttl=3600, show_spinner="📋 Fetching SEC filings...")
 def fetch_sec_earnings(ticker, quarters=4):
     """
-    Fetch recent 10-Q/10-K filings from SEC EDGAR and extract real data.
+    Fetch recent financial data directly from SEC XBRL APIs.
+    This is more reliable than scraping raw filings.
     """
     filings_data = []
-    
+
     # 1. Look up CIK using a Ticker-to-CIK mapping
     try:
         url = "https://www.sec.gov/files/company_tickers.json"
         headers = {'User-Agent': 'Financial Analyzer App/1.0 (info@example.com)'}
         response = requests.get(url, headers=headers)
-        response.raise_for_status()  # This will raise an HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
         ticker_data = response.json()
         
-        # Check if the response is a list before proceeding
         if not isinstance(ticker_data, list):
             st.error("❌ SEC API returned unexpected data format for ticker lookup.")
             return []
 
         cik = None
         for company in ticker_data:
-            # Add a check to ensure 'company' is a dictionary and has the 'ticker' key
             if isinstance(company, dict) and company.get('ticker') == ticker:
                 cik = str(company['cik_str']).zfill(10)
                 break
@@ -82,89 +81,69 @@ def fetch_sec_earnings(ticker, quarters=4):
         st.error("❌ Failed to decode JSON from SEC ticker lookup API.")
         return []
 
-    # The rest of the function remains the same.
-    # 2. Get recent filings from the submissions API
+    # 2. Get company facts using the XBRL API
     try:
-        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
         headers = {'User-Agent': 'Financial Analyzer App/1.0 (info@example.com)'}
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        filings = response.json().get('filings', {}).get('recent', {})
+        company_facts = response.json()
     except requests.exceptions.RequestException as e:
-        st.error(f"❌ Failed to fetch filings for CIK {cik}: {e}")
+        st.error(f"❌ Failed to fetch company facts for CIK {cik}: {e}")
         return []
     except json.JSONDecodeError:
-        st.error("❌ Failed to decode JSON from SEC submissions API.")
+        st.error("❌ Failed to decode JSON from SEC company facts API.")
         return []
+
+    # 3. Extract and parse relevant financial data
+    try:
+        us_gaap_data = company_facts.get('facts', {}).get('us-gaap', {})
+        
+        revenue_facts = us_gaap_data.get('Revenues', {}).get('units', {}).get('USD', [])
+        eps_facts = us_gaap_data.get('EarningsPerShareDiluted', {}).get('units', {}).get('USD-per-share', [])
+        net_income_facts = us_gaap_data.get('NetIncomeLoss', {}).get('units', {}).get('USD', [])
+        
+        # Sort facts by end date to get the most recent ones
+        all_facts = sorted(
+            [f for f in revenue_facts + eps_facts + net_income_facts if f.get('form') in ['10-Q', '10-K']],
+            key=lambda x: datetime.strptime(x['end'], '%Y-%m-%d'),
+            reverse=True
+        )
+
+        seen_periods = set()
+        for fact in all_facts:
+            period_end = fact.get('end')
+            form_type = fact.get('form')
+            
+            if period_end not in seen_periods and len(filings_data) < quarters:
+                filing = {
+                    'date': period_end,
+                    'type': form_type,
+                    'revenue': None,
+                    'eps': None,
+                    'net_income': None
+                }
+                
+                # Find matching revenue, EPS, and net income for this period
+                for rev_fact in revenue_facts:
+                    if rev_fact.get('end') == period_end:
+                        filing['revenue'] = rev_fact.get('val')
+                        break
+                for eps_fact in eps_facts:
+                    if eps_fact.get('end') == period_end:
+                        filing['eps'] = eps_fact.get('val')
+                        break
+                for ni_fact in net_income_facts:
+                    if ni_fact.get('end') == period_end:
+                        filing['net_income'] = ni_fact.get('val')
+                        break
+                
+                filings_data.append(filing)
+                seen_periods.add(period_end)
     
-    # 3. Filter for 10-Q and 10-K reports
-    found_count = 0
-    if filings.get('accessionNumber'):
-        for i in range(len(filings['accessionNumber'])):
-            if found_count >= quarters:
-                break
-                
-            form_type = filings['form'][i]
-            if form_type in ['10-Q', '10-K']:
-                accession_number = filings['accessionNumber'][i].replace('-', '')
-                report_date = filings['filingDate'][i]
-                
-                # Construct URL to the XBRL file (more reliable)
-                xbrl_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_number}/Financial_Report.xml"
-                
-                try:
-                    xbrl_response = requests.get(xbrl_url, headers=headers)
-                    xbrl_response.raise_for_status()
-                    
-                    # Simple XML/XBRL parsing to find key values
-                    soup = BeautifulSoup(xbrl_response.content, 'xml')
-                    
-                    latest_date_context = soup.find(lambda tag: tag.name.endswith('context') and 'instant' in tag.prettify())
-                    
-                    if not latest_date_context:
-                        continue
-
-                    revenue_tags = ['us-gaap:Revenues', 'us-gaap:NetSales']
-                    net_income_tags = ['us-gaap:NetIncomeLoss']
-                    eps_tags = ['us-gaap:EarningsPerShareDiluted']
-                    
-                    revenue, net_income, eps = None, None, None
-                    
-                    # Iterate through tags to find values
-                    for tag in revenue_tags:
-                        found_tag = soup.find(tag, contextref=latest_date_context.get('id'))
-                        if found_tag and found_tag.text:
-                            revenue = float(found_tag.text)
-                            break
-
-                    for tag in net_income_tags:
-                        found_tag = soup.find(tag, contextref=latest_date_context.get('id'))
-                        if found_tag and found_tag.text:
-                            net_income = float(found_tag.text)
-                            break
-                            
-                    for tag in eps_tags:
-                        found_tag = soup.find(tag, contextref=latest_date_context.get('id'))
-                        if found_tag and found_tag.text:
-                            eps = float(found_tag.text)
-                            break
-
-                    filing_summary = {
-                        'date': report_date,
-                        'type': form_type,
-                        'period': f"Q{found_count + 1}",
-                        'revenue': revenue,
-                        'net_income': net_income,
-                        'eps': eps,
-                        'url': xbrl_url
-                    }
-                    filings_data.append(filing_summary)
-                    found_count += 1
-                    
-                except requests.exceptions.RequestException as e:
-                    st.warning(f"⚠️ Failed to fetch or parse XBRL for {ticker} filing on {report_date}: {e}")
-                except Exception as e:
-                    st.warning(f"⚠️ Error parsing financial data for {ticker} filing on {report_date}: {e}")
+    except Exception as e:
+        st.error(f"⚠️ Error parsing financial data for {ticker}: {e}")
+        return []
 
     return filings_data
 
@@ -489,73 +468,4 @@ def display_ai_analysis(analysis):
         recommendation = safe_get(analysis, 'recommendation')
         color = "#a3d900" if "Buy" in recommendation else "#fdd835" if "Hold" in recommendation else "#f44336"
         st.markdown(f"""
-        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid {color};">
-            <h4 style="margin: 0; color: {color};">💡 Recommendation</h4>
-            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{recommendation}</p>
-        </div>
-        """, unsafe_allow_html=True)
-    with col3:
-        risk_level = safe_get(analysis, 'risk_level')
-        risk_colors = {"Low": "#a3d900", "Medium": "#fdd835", "High": "#f44336"}
-        risk_color = risk_colors.get(risk_level, "#bbbbbb")
-        st.markdown(f"""
-        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid {risk_color};">
-            <h4 style="margin: 0; color: {risk_color};">⚠️ Risk Level</h4>
-            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{risk_level}</p>
-        </div>
-        """, unsafe_allow_html=True)
-    with col4:
-        valuation = safe_get(analysis, 'valuation_assessment')
-        st.markdown(f"""
-        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid #00bcd4;">
-            <h4 style="margin: 0; color: #00bcd4;">💰 Valuation</h4>
-            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{valuation}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Investment thesis
-    st.markdown("### 🎯 Investment Thesis")
-    st.info(safe_get(analysis, 'investment_thesis'))
-
-    # Detailed analysis
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### ✅ Key Strengths")
-        for strength in safe_get(analysis, 'key_strengths', []):
-            st.success(f"✓ {strength}")
-        st.markdown("### 📈 Earnings Performance")
-        earnings = safe_get(analysis, 'earnings_surprises', {})
-        st.write(f"**Revenue:** {safe_get(earnings, 'revenue_beat_miss')}")
-        st.write(f"**EPS:** {safe_get(earnings, 'eps_beat_miss')}")
-        st.write(f"**Guidance:** {safe_get(earnings, 'guidance_reaction')}")
-    with col2:
-        st.markdown("### ⚠️ Key Risks")
-        for risk in safe_get(analysis, 'key_risks', []):
-            st.error(f"✗ {risk}")
-        st.markdown("### 🔮 Price Catalysts")
-        for catalyst in safe_get(analysis, 'price_catalysts', []):
-            st.info(f"• {catalyst}")
-
-    # Financial health and competitive position
-    st.markdown("### 💼 Financial Health & Competitive Position")
-    financial_health = safe_get(analysis, 'financial_health', {})
-    st.write(f"**Revenue Trend:** {safe_get(financial_health, 'revenue_trend')}")
-    st.write(f"**Profitability:** {safe_get(financial_health, 'profitability')}")
-    st.write(f"**Balance Sheet:** {safe_get(financial_health, 'balance_sheet')}")
-    st.write(f"**Competitive Position:** {safe_get(analysis, 'competitive_position')}")
-    st.write(f"**Valuation:** {safe_get(analysis, 'valuation_assessment')}")
-
-    # Analyst consensus
-    st.markdown("### 👥 Analyst Consensus")
-    consensus = safe_get(analysis, 'analyst_consensus', {})
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Average Rating", safe_get(consensus, 'avg_rating'))
-    with col2:
-        st.metric("Price Target Range", safe_get(consensus, 'price_target_range'))
-    with col3:
-        st.write("**Sentiment Shift**")
-        st.write(safe_get(consensus, 'sentiment_shift'))
-
-if __name__ == "__main__":
-    render_dashboard()
+        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-
