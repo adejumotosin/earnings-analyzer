@@ -468,4 +468,73 @@ def display_ai_analysis(analysis):
         recommendation = safe_get(analysis, 'recommendation')
         color = "#a3d900" if "Buy" in recommendation else "#fdd835" if "Hold" in recommendation else "#f44336"
         st.markdown(f"""
-        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-
+        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid {color};">
+            <h4 style="margin: 0; color: {color};">💡 Recommendation</h4>
+            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{recommendation}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        risk_level = safe_get(analysis, 'risk_level')
+        risk_colors = {"Low": "#a3d900", "Medium": "#fdd835", "High": "#f44336"}
+        risk_color = risk_colors.get(risk_level, "#bbbbbb")
+        st.markdown(f"""
+        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid {risk_color};">
+            <h4 style="margin: 0; color: {risk_color};">⚠️ Risk Level</h4>
+            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{risk_level}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        valuation = safe_get(analysis, 'valuation_assessment')
+        st.markdown(f"""
+        <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid #00bcd4;">
+            <h4 style="margin: 0; color: #00bcd4;">💰 Valuation</h4>
+            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{valuation}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Investment thesis
+    st.markdown("### 🎯 Investment Thesis")
+    st.info(safe_get(analysis, 'investment_thesis'))
+
+    # Detailed analysis
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### ✅ Key Strengths")
+        for strength in safe_get(analysis, 'key_strengths', []):
+            st.success(f"✓ {strength}")
+        st.markdown("### 📈 Earnings Performance")
+        earnings = safe_get(analysis, 'earnings_surprises', {})
+        st.write(f"**Revenue:** {safe_get(earnings, 'revenue_beat_miss')}")
+        st.write(f"**EPS:** {safe_get(earnings, 'eps_beat_miss')}")
+        st.write(f"**Guidance:** {safe_get(earnings, 'guidance_reaction')}")
+    with col2:
+        st.markdown("### ⚠️ Key Risks")
+        for risk in safe_get(analysis, 'key_risks', []):
+            st.error(f"✗ {risk}")
+        st.markdown("### 🔮 Price Catalysts")
+        for catalyst in safe_get(analysis, 'price_catalysts', []):
+            st.info(f"• {catalyst}")
+
+    # Financial health and competitive position
+    st.markdown("### 💼 Financial Health & Competitive Position")
+    financial_health = safe_get(analysis, 'financial_health', {})
+    st.write(f"**Revenue Trend:** {safe_get(financial_health, 'revenue_trend')}")
+    st.write(f"**Profitability:** {safe_get(financial_health, 'profitability')}")
+    st.write(f"**Balance Sheet:** {safe_get(financial_health, 'balance_sheet')}")
+    st.write(f"**Competitive Position:** {safe_get(analysis, 'competitive_position')}")
+    st.write(f"**Valuation:** {safe_get(analysis, 'valuation_assessment')}")
+
+    # Analyst consensus
+    st.markdown("### 👥 Analyst Consensus")
+    consensus = safe_get(analysis, 'analyst_consensus', {})
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Average Rating", safe_get(consensus, 'avg_rating'))
+    with col2:
+        st.metric("Price Target Range", safe_get(consensus, 'price_target_range'))
+    with col3:
+        st.write("**Sentiment Shift**")
+        st.write(safe_get(consensus, 'sentiment_shift'))
+
+if __name__ == "__main__":
+    render_dashboard()
