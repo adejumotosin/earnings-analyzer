@@ -82,50 +82,104 @@ def fetch_sec_earnings(ticker, quarters=4):
         st.info(f"No 10-Q or 10-K filings found for {ticker}.")
         return []
 
-    # Step 2: For each filing, use the XBRL-to-JSON Converter API
+    # Step 2: For each filing, extract financial data
     for filing in filings:
-        filing_url = filing.get("linkToFilingDetails")
-        if not filing_url:
-            continue
-            
-        xbrl_url = "https://api.sec-api.io/xbrl-to-json"
-        
         try:
+            # Method 1: Try to get the XBRL document URL directly
+            xbrl_url = filing.get("documentFormatFiles", [{}])[0].get("documentUrl", "")
+            
+            # If no direct XBRL URL, construct it from the accession number
+            if not xbrl_url or not xbrl_url.endswith('.xml'):
+                accession_number = filing.get("accessionNo", "").replace("-", "")
+                cik = filing.get("cik", "")
+                form_type = filing.get("formType", "").lower()
+                
+                # Construct the XBRL instance document URL
+                xbrl_filename = f"{ticker.lower()}-{filing.get('periodOfReport', '').replace('-', '')}.htm"
+                xbrl_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number}/{xbrl_filename}"
+            
+            # Use the XBRL-to-JSON Converter API
+            converter_url = "https://api.sec-api.io/xbrl-to-json"
+            
             xbrl_response = requests.get(
-                xbrl_url, params={"url": filing_url}, headers={"Authorization": api_key}
+                converter_url, 
+                params={"url": xbrl_url}, 
+                headers={"Authorization": api_key},
+                timeout=30
             )
             xbrl_response.raise_for_status()
             data = xbrl_response.json()
             
-            # The API returns a list of income statements, we take the last one
-            income_statements = data.get("incomeStatement", [])
-            if not income_statements:
-                continue
-                
-            last_statement = income_statements[-1]
-
+            # Extract financial metrics
             revenue = None
             net_income = None
             eps = None
             
-            for fact in last_statement:
-                if fact.get("concept") == "Revenues":
-                    revenue = fact.get("value")
-                elif fact.get("concept") == "NetIncomeLoss":
-                    net_income = fact.get("value")
-                elif fact.get("concept") == "EarningsPerShareDiluted":
-                    eps = fact.get("value")
+            # Try different possible locations for the data
+            income_statements = data.get("IncomeStatements", data.get("incomeStatement", []))
             
-            filings_data.append({
+            if income_statements:
+                # Take the most recent period
+                latest_statement = income_statements[0] if isinstance(income_statements, list) else income_statements
+                
+                # Look for revenue in various forms
+                revenue_fields = ['Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', 
+                                'SalesRevenueNet', 'RevenueFromContractWithCustomer']
+                for field in revenue_fields:
+                    if field in latest_statement:
+                        revenue = latest_statement[field]
+                        break
+                
+                # Look for net income
+                income_fields = ['NetIncomeLoss', 'NetIncomeLossAvailableToCommonStockholdersBasic',
+                               'ProfitLoss']
+                for field in income_fields:
+                    if field in latest_statement:
+                        net_income = latest_statement[field]
+                        break
+                
+                # Look for EPS
+                eps_fields = ['EarningsPerShareDiluted', 'EarningsPerShareBasic']
+                for field in eps_fields:
+                    if field in latest_statement:
+                        eps = latest_statement[field]
+                        break
+            
+            # Alternative: Look in the BalanceSheets or other sections if IncomeStatements is empty
+            if not revenue and not net_income:
+                # Try to extract from raw facts
+                facts = data.get("facts", {})
+                if facts:
+                    # Look through all facts for revenue and income items
+                    for concept, values in facts.items():
+                        if 'revenue' in concept.lower() and not revenue:
+                            revenue = values.get("value") if isinstance(values, dict) else values[0].get("value") if values else None
+                        elif 'netincome' in concept.lower() and not net_income:
+                            net_income = values.get("value") if isinstance(values, dict) else values[0].get("value") if values else None
+            
+            filing_data = {
                 'date': filing.get("filedAt"),
+                'period': filing.get("periodOfReport"),
                 'type': filing.get("formType"),
                 'revenue': revenue,
                 'eps': eps,
-                'net_income': net_income
-            })
-
+                'net_income': net_income,
+                'accession_number': filing.get("accessionNo")
+            }
+            
+            filings_data.append(filing_data)
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 400:
+                st.warning(f"⚠️ Could not process {filing.get('formType', 'filing')} from {filing.get('filedAt', 'unknown date')}: Invalid XBRL format or URL")
+            else:
+                st.warning(f"⚠️ HTTP error processing filing: {e}")
+            continue
         except requests.exceptions.RequestException as e:
-            st.warning(f"⚠️ Failed to process a filing: {e}")
+            st.warning(f"⚠️ Network error processing filing: {e}")
+            continue
+        except (KeyError, IndexError, TypeError) as e:
+            st.warning(f"⚠️ Data parsing error for filing: {e}")
             continue
 
     return filings_data
@@ -223,7 +277,7 @@ def fetch_market_data(ticker, days=90):
             return {}
 
         current_price = hist['Close'][-1]
-        price_change_30d = ((current_price - hist['Close'][-30]) / hist['Close'][-30]) * 100
+        price_change_30d = ((current_price - hist['Close'][-30]) / hist['Close'][-30]) * 100 if len(hist) >= 30 else 0
         avg_volume = hist['Volume'].mean()
 
         market_data = {
@@ -373,8 +427,10 @@ def render_dashboard():
             st.markdown("#### SEC Filing Summary")
             if sec_data:
                 df = pd.DataFrame(sec_data)
-                df['revenue'] = df['revenue'].apply(lambda x: format_currency(x) if x is not None else 'N/A')
-                df['net_income'] = df['net_income'].apply(lambda x: format_currency(x) if x is not None else 'N/A')
+                if 'revenue' in df.columns:
+                    df['revenue'] = df['revenue'].apply(lambda x: format_currency(x) if x is not None else 'N/A')
+                if 'net_income' in df.columns:
+                    df['net_income'] = df['net_income'].apply(lambda x: format_currency(x) if x is not None else 'N/A')
                 st.dataframe(df, use_container_width=True)
             else:
                 st.info(f"No SEC filings found for {ticker}.")
@@ -468,10 +524,12 @@ def display_ai_analysis(analysis):
         """, unsafe_allow_html=True)
     with col4:
         valuation = safe_get(analysis, 'valuation_assessment')
+        # Truncate long valuation text for display
+        display_valuation = valuation[:50] + "..." if len(str(valuation)) > 50 else valuation
         st.markdown(f"""
         <div style="background-color: #444444; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid #00bcd4;">
             <h4 style="margin: 0; color: #00bcd4;">💰 Valuation</h4>
-            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff;">{valuation}</p>
+            <p style="margin: 0.5rem 0 0 0; font-weight: 600; color: #ffffff; font-size: 0.9rem;">{display_valuation}</p>
         </div>
         """, unsafe_allow_html=True)
 
