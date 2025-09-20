@@ -8,6 +8,7 @@ import streamlit as st
 import google.generativeai as genai
 import yfinance as yf
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -43,64 +44,79 @@ def parse_number(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
-        # Remove commas, parentheses (negatives), currency symbols
         s = value.strip().replace(",", "")
         sign = -1 if ("(" in s and ")" in s) else 1
         s = s.replace("(", "").replace(")", "").replace("$", "")
-        # Sometimes the string contains text like "1000 (thousands)" — try to keep numeric prefix
-        # Split by space and take first numeric-like token
         token = s.split()[0] if s.split() else s
         try:
             return sign * float(token)
         except Exception:
             return None
-    # Unknown type
     return None
 
 def extract_fact_value(obj: Any) -> Optional[float]:
     """
-    Extract value from a sec-api xbrl-to-json fact entry.
-    Handles:
-      - dicts with 'value'
-      - lists of dicts (take first or last with 'value')
-      - simple scalars
-    Returns numeric float or None.
+    Extract numeric value from sec-api xbrl-to-json fact entry.
+    Handles dicts with 'value', lists, and scalars.
     """
     if obj is None:
         return None
-    # If already numeric
     if isinstance(obj, (int, float)) and not isinstance(obj, bool):
         return float(obj)
-    # If dict with 'value'
     if isinstance(obj, dict):
-        # Sometimes value is nested under 'value'
         if "value" in obj:
             return parse_number(obj.get("value"))
-        # Some objects are concept->period->value structures; try to locate any numeric field
         for k in ("val", "amount", "value"):
             if k in obj:
                 return parse_number(obj.get(k))
-        # fallback: attempt to stringify
-        return parse_number(json.dumps(obj))
-    # If list, inspect items for 'value'
+        # try scanning nested dict values
+        for v in obj.values():
+            vnum = extract_fact_value(v)
+            if vnum is not None:
+                return vnum
+        return None
     if isinstance(obj, list) and obj:
-        # prefer last (most recent) with value
         for item in reversed(obj):
             if isinstance(item, dict) and "value" in item:
                 return parse_number(item.get("value"))
-            if isinstance(item, dict):
-                # try common numeric keys
-                for k in ("value", "val", "amount"):
-                    if k in item:
-                        return parse_number(item.get(k))
-            else:
+            if isinstance(item, (int, float)):
+                return float(item)
+            if isinstance(item, str):
                 v = parse_number(item)
                 if v is not None:
                     return v
-        # fallback to parse first element
-        return parse_number(obj[0])
-    # If scalar string
-    return parse_number(obj)
+        # fallback: parse first element
+        return extract_fact_value(obj[0])
+    if isinstance(obj, str):
+        return parse_number(obj)
+    return None
+
+def format_currency(value: Optional[float]) -> str:
+    """Formats a number into a readable currency string or returns 'N/A'."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "N/A"
+    try:
+        if value >= 1e12:
+            return f"${value / 1e12:.2f}T"
+        if value >= 1e9:
+            return f"${value / 1e9:.2f}B"
+        if value >= 1e6:
+            return f"${value / 1e6:.2f}M"
+        return f"${value:,.2f}"
+    except Exception:
+        return "N/A"
+
+def safe_format(val: Any) -> str:
+    """Used for DataFrame display: converts to currency or 'N/A'."""
+    try:
+        num = None
+        if isinstance(val, (int, float)):
+            num = float(val)
+        else:
+            num = parse_number(val)
+        return format_currency(num) if num is not None else "N/A"
+    except Exception:
+        return "N/A"
 
 # -------------------------
 # SEC XBRL -> JSON fetcher
@@ -158,11 +174,10 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
         candidates = []
         if link_xbrl:
             candidates.append(("xbrl-url", link_xbrl))
-        # If documentFormatFiles includes an xml extracted instance, prefer that (some responses include it)
+        # Extract any .xml in documentFormatFiles
         for doc in doc_files:
             url = doc.get("documentUrl") or doc.get("downloadUrl")
             if url and isinstance(url, str) and url.lower().endswith(".xml"):
-                # Add as xbrl-url if not duplicates
                 if ("xbrl-url", url) not in candidates:
                     candidates.append(("xbrl-url", url))
         if link_html:
@@ -177,7 +192,6 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
 
         xbrl_json = None
         used_param = None
-        # Try candidates until one returns 200
         for param_name, param_value in candidates:
             try:
                 resp_conv = requests.get(converter_endpoint, params={param_name: param_value}, headers={"Authorization": SEC_API_KEY}, timeout=30)
@@ -210,19 +224,17 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
 
         # If not found, try 'facts' as last resort
         if income_block is None:
-            # Many sec-api responses include 'facts' with concepts
             facts = xbrl_json.get("facts") or {}
-            # Try to extract common concepts from facts
             rev = None
             ni = None
             eps_val = None
             for concept_key, concept_value in facts.items():
-                lower = concept_key.lower()
-                if "revenue" in lower and rev is None:
+                low = concept_key.lower()
+                if "revenue" in low and rev is None:
                     rev = extract_fact_value(concept_value)
-                if "netincome" in lower and ni is None:
+                if "netincome" in low and ni is None:
                     ni = extract_fact_value(concept_value)
-                if ("earningspershare" in lower or "eps" in lower) and eps_val is None:
+                if ("earningspershare" in low or "eps" in low) and eps_val is None:
                     eps_val = extract_fact_value(concept_value)
             filings_data.append({
                 "filed_at": filed_at,
@@ -236,18 +248,14 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
             })
             continue
 
-        # income_block may be list or dict. Normalize to dict (most recent)
+        # Normalize income_block
         chosen_statement = None
         if isinstance(income_block, list) and len(income_block) > 0:
-            # Some lists are lists of period dicts OR lists of fact dicts.
-            # If list of dicts with named keys use last item; if list of facts, try to build mapping.
-            # Prefer the last element that looks like a dict with named financial fields
             for item in reversed(income_block):
                 if isinstance(item, dict) and any(k.lower() in map(str.lower, item.keys()) for k in ("Revenues", "NetIncomeLoss", "EarningsPerShareDiluted")):
                     chosen_statement = item
                     break
             if chosen_statement is None:
-                # fallback to last element
                 chosen_statement = income_block[-1]
         elif isinstance(income_block, dict):
             chosen_statement = income_block
@@ -256,14 +264,11 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
                 st.warning(f"⚠️ Unexpected format for income block in filing {filed_at}: {type(income_block)}")
             continue
 
-        # Extract fields using robust extractor
         revenue_raw = None
         net_income_raw = None
         eps_raw = None
 
-        # If chosen_statement is dict of named fields
         if isinstance(chosen_statement, dict):
-            # Try common field names
             for key in ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "TotalRevenue"):
                 if key in chosen_statement and revenue_raw is None:
                     revenue_raw = chosen_statement.get(key)
@@ -274,7 +279,6 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
                 if key in chosen_statement and eps_raw is None:
                     eps_raw = chosen_statement.get(key)
 
-            # If fields are still None, inspect all values for likely candidates
             if revenue_raw is None or net_income_raw is None or eps_raw is None:
                 for k, v in chosen_statement.items():
                     low = k.lower()
@@ -285,7 +289,6 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
                     if eps_raw is None and ("earningspershare" in low or "eps" in low):
                         eps_raw = eps_raw or v
 
-        # If chosen_statement is list of facts (concept/value dicts)
         if isinstance(chosen_statement, list):
             for fact in reversed(chosen_statement):
                 concept = fact.get("concept") or ""
@@ -316,7 +319,7 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
     return filings_data, raw_responses
 
 # -------------------------
-# Simulated transcripts & analysts (unchanged)
+# Simulated transcripts & analysts
 # -------------------------
 @st.cache_data(ttl=3600, show_spinner="🎙️ Fetching earnings call transcripts...")
 def fetch_earnings_transcripts(ticker: str, quarters: int = 2):
@@ -370,15 +373,15 @@ def fetch_market_data(ticker: str, days: int = 90):
             "pe_ratio": info.get("trailingPE", 0),
             "price_change_30d": price_change_30d,
             "avg_volume": avg_vol,
-            "price_history": hist["Close"].tolist()[-30:],
-            "volume_history": hist["Volume"].tolist()[-30:] if "Volume" in hist.columns else []
+            "price_history": hist["Close"].tolist()[-90:],
+            "dates": [d.strftime("%Y-%m-%d") for d in hist.index.tolist()[-90:]]
         }
     except Exception as e:
         st.warning(f"⚠️ Market data fetch failed: {e}")
         return {}
 
 # -------------------------
-# AI Analysis (Gemini) - send summarized context only
+# AI Analysis (Gemini) - summarized context only
 # -------------------------
 @st.cache_data(ttl=7200, show_spinner="🤖 Generating AI analysis...")
 def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: List[Dict], analyst_reports: List[Dict], market_data: Dict):
@@ -387,11 +390,10 @@ def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: 
     Expect JSON back; handle parse errors gracefully.
     """
     try:
-        # Build compact filings summary
         filings_summary = []
         for f in sec_filings:
             filings_summary.append({
-                "date": f.get("filed_at"),
+                "filed_at": f.get("filed_at"),
                 "period": f.get("period"),
                 "type": f.get("type"),
                 "revenue": f.get("revenue"),
@@ -406,14 +408,12 @@ key_strengths (list), key_risks (list), analyst_consensus (avg_rating, price_tar
 earnings_surprises (revenue_beat_miss, eps_beat_miss, guidance_reaction), competitive_position, valuation_assessment,
 price_catalysts (list), recommendation, risk_level.
 
-Keep each field short. Use the numeric SEC metrics provided (date, revenue, eps, net_income) and analyst summaries.
-
 SEC_FILINGS_SUMMARY = {json.dumps(filings_summary)}
 TRANSCRIPTS = {json.dumps(transcripts)}
 ANALYSTS = {json.dumps(analyst_reports)}
 MARKET = {json.dumps({'current_price': market_data.get('current_price'), 'pe_ratio': market_data.get('pe_ratio'), 'market_cap': market_data.get('market_cap')})}
 
-Return ONLY the JSON object, no extra commentary.
+Return ONLY the JSON object, no additional text.
 """
         model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(
@@ -421,11 +421,10 @@ Return ONLY the JSON object, no extra commentary.
             generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
         )
 
-        # Parse JSON safely
         text = response.text
         return json.loads(text)
     except json.JSONDecodeError as e:
-        st.error(f"⚠️ AI analysis failed to return valid JSON: {e}. Raw response truncated:\n{text[:2000]}")
+        st.error(f"⚠️ AI analysis failed to return valid JSON: {e}. Raw (truncated): {text[:2000] if 'text' in locals() else 'NO RESPONSE'}")
         return {}
     except Exception as e:
         st.error(f"⚠️ AI analysis failed: {e}")
@@ -455,23 +454,21 @@ def render_dashboard():
             sec_data, raw_responses = fetch_sec_earnings(ticker, quarters, debug=debug)
             transcripts = fetch_earnings_transcripts(ticker, quarters)
             analyst_data = fetch_analyst_sentiment(ticker)
-            market_data = fetch_market_data(ticker)
+            market_data = fetch_market_data(ticker, days=90)
 
-        # Show raw tabs
+        # Tabs
         st.subheader("Source Data Overview")
         tab1, tab2, tab3, tab4 = st.tabs(["📋 SEC Filings", "🎙️ Transcripts", "📰 Analysts", "📈 Market"])
 
         with tab1:
             if sec_data:
                 df = pd.DataFrame(sec_data)
-                # Format numbers nicely
                 for col in ("revenue","net_income","eps"):
                     if col in df.columns:
-                        df[col] = df[col].apply(lambda x: format_currency(x) if x is not None else "N/A")
+                        df[col] = df[col].apply(lambda x: safe_format(x))
                 st.dataframe(df, use_container_width=True)
 
                 with st.expander("🔎 Show Raw SEC JSON (Debug)"):
-                    # Show raw responses (may be large)
                     st.write("Raw converter responses (by filing date):")
                     st.json(raw_responses)
             else:
@@ -495,85 +492,89 @@ def render_dashboard():
                 for a in analyst_data:
                     with st.expander(f"{a.get('firm')} — {a.get('rating')}"):
                         st.write(a.get("headline"))
-                        for p in a.get("key_points", []):
+                        for p in a.get("key_points", a.get("key_points", [])):
                             st.write(f"- {p}")
             else:
                 st.info("No analyst reports.")
 
         with tab4:
             if market_data:
-                st.metric("Current Price", format_currency(market_data.get("current_price",0)))
-                st.metric("30-Day Change", f"{market_data.get('price_change_30d',0):.1f}%")
-                st.metric("P/E Ratio", f"{market_data.get('pe_ratio',0)}")
-                st.metric("Market Cap", format_currency(market_data.get("market_cap",0)))
+                # Key metrics
+                st.metric("Current Price", format_currency(market_data.get("current_price", 0)))
+                st.metric("30-Day Change", f"{market_data.get('price_change_30d', 0):.1f}%")
+                st.metric("P/E Ratio", f"{market_data.get('pe_ratio', 'N/A')}")
+                st.metric("Market Cap", format_currency(market_data.get("market_cap", 0)))
+
+                # Stock price chart (Plotly)
+                ph = market_data.get("price_history", [])
+                dates = market_data.get("dates", [])
+                if ph and dates and len(ph) == len(dates):
+                    df_price = pd.DataFrame({"date": pd.to_datetime(dates), "close": ph})
+                    fig_price = px.line(df_price, x="date", y="close", title=f"{ticker} - Last {len(ph)} Days Close")
+                    fig_price.update_yaxes(tickprefix="$")
+                    st.plotly_chart(fig_price, use_container_width=True)
             else:
                 st.info("No market data.")
 
-        # Plotly charts: Revenue, Net Income, EPS over filings
-        # Build a DataFrame of numeric series for charting
+        # Plotly charts for filings
         numeric_rows = []
         for f in sec_data:
-            d = {
+            numeric_rows.append({
                 "filed_at": f.get("filed_at"),
                 "period": f.get("period"),
                 "revenue": f.get("revenue"),
                 "net_income": f.get("net_income"),
                 "eps": f.get("eps")
-            }
-            numeric_rows.append(d)
+            })
 
         if numeric_rows:
             chart_df = pd.DataFrame(numeric_rows)
-            # Convert filed_at or period to datetime
             if "period" in chart_df.columns and chart_df["period"].notna().any():
-                # prefer period if available
                 chart_df["x"] = pd.to_datetime(chart_df["period"], errors="coerce")
             else:
                 chart_df["x"] = pd.to_datetime(chart_df["filed_at"], errors="coerce")
-
             chart_df = chart_df.sort_values("x")
-            # Revenue chart
-            revenue_df = chart_df.dropna(subset=["revenue", "x"])[["x","revenue"]]
-            if not revenue_df.empty:
-                fig_rev = px.line(revenue_df, x="x", y="revenue", markers=True, title="Revenue Trend")
-                fig_rev.update_yaxes(tickprefix="$")
-                st.plotly_chart(fig_rev, use_container_width=True)
-            # Net income
-            ni_df = chart_df.dropna(subset=["net_income","x"])[["x","net_income"]]
-            if not ni_df.empty:
-                fig_ni = px.line(ni_df, x="x", y="net_income", markers=True, title="Net Income Trend")
-                fig_ni.update_yaxes(tickprefix="$")
-                st.plotly_chart(fig_ni, use_container_width=True)
-            # EPS
-            eps_df = chart_df.dropna(subset=["eps","x"])[["x","eps"]]
-            if not eps_df.empty:
-                fig_eps = px.line(eps_df, x="x", y="eps", markers=True, title="EPS Trend")
-                st.plotly_chart(fig_eps, use_container_width=True)
 
-        # AI analysis (summarized)
+            # Revenue / Net Income combined figure
+            rev_df = chart_df.dropna(subset=["revenue","x"])[["x","revenue"]]
+            ni_df = chart_df.dropna(subset=["net_income","x"])[["x","net_income"]]
+            eps_df = chart_df.dropna(subset=["eps","x"])[["x","eps"]]
+
+            if not rev_df.empty or not ni_df.empty or not eps_df.empty:
+                fig = go.Figure()
+                if not rev_df.empty:
+                    fig.add_trace(go.Bar(x=rev_df["x"], y=rev_df["revenue"], name="Revenue", yaxis="y1"))
+                if not ni_df.empty:
+                    fig.add_trace(go.Bar(x=ni_df["x"], y=ni_df["net_income"], name="Net Income", yaxis="y1"))
+                if not eps_df.empty:
+                    fig.add_trace(go.Line(x=eps_df["x"], y=eps_df["eps"], name="EPS", yaxis="y2", marker=dict(symbol="diamond")))
+                # axes
+                fig.update_layout(
+                    title="Revenue & Net Income (bars) and EPS (line)",
+                    xaxis=dict(title="Period"),
+                    yaxis=dict(title="Amount (USD)", tickprefix="$"),
+                    yaxis2=dict(title="EPS", overlaying="y", side="right")
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        # AI analysis
         st.markdown("---")
         st.header("🤖 AI Investment Analysis")
         with st.spinner("🧠 Generating comprehensive analysis..."):
             analysis = analyze_earnings_with_ai(ticker, sec_data, transcripts, analyst_data, market_data)
 
         if analysis:
-            # If the model returned a dict, pretty display; otherwise show raw
             if isinstance(analysis, dict):
-                # Top-level highlights
-                # Show grade / recommendation if present
+                # show top metrics if present
                 grade = analysis.get("overall_grade", "N/A")
                 rec = analysis.get("recommendation", "N/A")
-                st.metric("Overall Grade", grade)
-                st.metric("Recommendation", rec)
+                st.markdown(f"**Overall Grade:** {grade}  \n**Recommendation:** {rec}")
                 st.json(analysis)
             else:
                 st.write("AI output (raw):")
                 st.write(analysis)
         else:
-            st.warning("AI analysis could not be generated. Check debug logs and raw SEC JSON.")
+            st.warning("AI analysis could not be generated. Check raw SEC JSON & debug logs.")
 
-# -------------------------
-# Entrypoint
-# -------------------------
 if __name__ == "__main__":
     render_dashboard()
