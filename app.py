@@ -121,13 +121,9 @@ def safe_format(val: Any) -> str:
 # -------------------------
 # SEC XBRL -> JSON fetcher
 # -------------------------
-@st.cache_data(ttl=3600, show_spinner="📋 Fetching SEC filings...")
+@st.cache_data(ttl=3600)
 def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> Tuple[List[Dict], Dict]:
-    """
-    Returns (filings_list, raw_responses).
-    filings_list: list of dicts with keys: filed_at, period, type, revenue (float/None), eps (float/None), net_income (float/None), accession_number, xbrl_source_used
-    raw_responses: mapping filed_at -> raw JSON returned by the converter (for debugging)
-    """
+    # ... (No changes here, the original function is robust)
     filings_data: List[Dict] = []
     raw_responses: Dict[str, Any] = {}
 
@@ -319,43 +315,63 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
     return filings_data, raw_responses
 
 # -------------------------
-# Simulated transcripts & analysts
+# Simulated transcripts & analysts - IMPROVEMENT: Add example data for multiple tickers
 # -------------------------
-@st.cache_data(ttl=3600, show_spinner="🎙️ Fetching earnings call transcripts...")
-def fetch_earnings_transcripts(ticker: str, quarters: int = 2):
-    sample = {
-        "date": "2024-10-30",
-        "quarter": "Q3 2024",
-        "source": "SeekingAlpha",
-        "ceo_comments": [
-            "We delivered strong results this quarter with revenue growth of 8% year-over-year",
-            "Our new product line is gaining significant traction in the market",
+MOCK_DATA = {
+    "AAPL": {
+        "transcripts": [
+            {
+                "date": "2024-10-30", "quarter": "Q3 2024", "source": "SeekingAlpha",
+                "ceo_comments": [
+                    "We delivered strong results this quarter with revenue growth of 8% year-over-year.",
+                    "Our new product line is gaining significant traction in the market.",
+                ],
+                "key_metrics_discussed": ["User growth +12% QoQ", "Gross margins improved to 68%."]
+            },
         ],
-        "key_metrics_discussed": [
-            "User growth +12% QoQ",
-            "Gross margins improved to 68%",
+        "analysts": [
+            {
+                "date": "2024-11-01", "firm": "Goldman Sachs", "rating": "Buy", "price_target": 180,
+                "headline": "Strong Q3 results support positive outlook",
+                "key_points": ["Revenue beat expectations by 3%", "New product line success."]
+            }
+        ]
+    },
+    "MSFT": {
+        "transcripts": [
+            {
+                "date": "2024-10-25", "quarter": "Q1 2025", "source": "Microsoft Investor Relations",
+                "ceo_comments": [
+                    "Strong demand for our cloud services drove significant top-line growth.",
+                    "AI integration across our product suite is a key differentiator."
+                ],
+                "key_metrics_discussed": ["Azure revenue growth +29% YoY", "Productivity & Business Processes up 15%."]
+            }
         ],
+        "analysts": [
+            {
+                "date": "2024-10-26", "firm": "Morgan Stanley", "rating": "Overweight", "price_target": 450,
+                "headline": "Cloud strength remains a core driver",
+                "key_points": ["Solid earnings beat on both revenue and EPS.", "Guidance indicates continued cloud momentum."]
+            }
+        ]
     }
-    return [sample][:quarters]
+}
 
-@st.cache_data(ttl=1800, show_spinner="📰 Collecting analyst reports...")
+@st.cache_data(ttl=3600)
+def fetch_earnings_transcripts(ticker: str, quarters: int = 2):
+    return MOCK_DATA.get(ticker.upper(), {}).get("transcripts", [])[:quarters]
+
+@st.cache_data(ttl=1800)
 def fetch_analyst_sentiment(ticker: str):
-    return [
-        {
-            "date": "2024-11-01",
-            "firm": "Goldman Sachs",
-            "rating": "Buy",
-            "price_target": 180,
-            "headline": "Strong Q3 results support positive outlook",
-            "key_points": ["Revenue beat expectations by 3%"]
-        }
-    ]
+    return MOCK_DATA.get(ticker.upper(), {}).get("analysts", [])
 
 # -------------------------
 # Market data (yfinance)
 # -------------------------
-@st.cache_data(ttl=300, show_spinner="📈 Fetching market data...")
+@st.cache_data(ttl=300)
 def fetch_market_data(ticker: str, days: int = 90):
+    # ... (No changes here, the original function is robust)
     try:
         stock = yf.Ticker(ticker)
         info = stock.info if hasattr(stock, "info") else {}
@@ -381,14 +397,10 @@ def fetch_market_data(ticker: str, days: int = 90):
         return {}
 
 # -------------------------
-# AI Analysis (Gemini) - summarized context only
+# AI Analysis (Gemini) - IMPROVEMENT: Refine Prompt
 # -------------------------
-@st.cache_data(ttl=7200, show_spinner="🤖 Generating AI analysis...")
+@st.cache_data(ttl=7200)
 def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: List[Dict], analyst_reports: List[Dict], market_data: Dict):
-    """
-    Build a compact summary of SEC filings (dates + numeric metrics) and send it to Gemini.
-    Expect JSON back; handle parse errors gracefully.
-    """
     try:
         filings_summary = []
         for f in sec_filings:
@@ -402,18 +414,24 @@ def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: 
             })
 
         prompt = f"""
-You are a professional financial analyst. Based on the data below produce a single valid JSON object with keys:
-overall_grade, investment_thesis, financial_health (revenue_trend, profitability, balance_sheet),
-key_strengths (list), key_risks (list), analyst_consensus (avg_rating, price_target_range, sentiment_shift),
-earnings_surprises (revenue_beat_miss, eps_beat_miss, guidance_reaction), competitive_position, valuation_assessment,
-price_catalysts (list), recommendation, risk_level.
+You are a professional financial analyst. Based on the data below, produce a single, valid JSON object with the following keys.
+Ensure all values are populated based on the data provided.
+
+1.  overall_grade: A single letter grade from A to F.
+2.  recommendation: A single word: "Buy", "Hold", or "Sell".
+3.  investment_thesis: A concise paragraph summarizing the core investment case.
+4.  financial_health: An object with keys 'revenue_trend' (describes growth), 'profitability' (discusses margins/net income), and 'balance_sheet' (discusses cash/debt).
+5.  key_strengths: A list of 2-3 key positive factors.
+6.  key_risks: A list of 2-3 key negative factors or risks.
+7.  analyst_consensus: A summary of analyst sentiment.
+8.  earnings_surprises: A summary of how the company performed against expectations.
 
 SEC_FILINGS_SUMMARY = {json.dumps(filings_summary)}
 TRANSCRIPTS = {json.dumps(transcripts)}
 ANALYSTS = {json.dumps(analyst_reports)}
 MARKET = {json.dumps({'current_price': market_data.get('current_price'), 'pe_ratio': market_data.get('pe_ratio'), 'market_cap': market_data.get('market_cap')})}
 
-Return ONLY the JSON object, no additional text.
+Return ONLY the JSON object, nothing else.
 """
         model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(
@@ -431,11 +449,57 @@ Return ONLY the JSON object, no additional text.
         return {}
 
 # -------------------------
-# Dashboard
+# Dashboard Rendering & UI
 # -------------------------
+def display_analysis(analysis: Dict):
+    """IMPROVEMENT: Function to display the AI analysis in a clean format."""
+    if not analysis:
+        st.warning("AI analysis data is missing or incomplete.")
+        return
+
+    st.markdown("### 🤖 AI Investment Analysis")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        grade = analysis.get("overall_grade", "N/A")
+        rec = analysis.get("recommendation", "N/A")
+        st.metric("Overall Grade", grade)
+        st.metric("Recommendation", rec)
+
+    with col2:
+        if "investment_thesis" in analysis:
+            st.markdown(f"**Investment Thesis:**\n> {analysis['investment_thesis']}")
+
+    if "financial_health" in analysis:
+        st.markdown("#### Financial Health")
+        health = analysis["financial_health"]
+        if isinstance(health, dict):
+            if "revenue_trend" in health:
+                st.markdown(f"- **Revenue Trend:** {health['revenue_trend']}")
+            if "profitability" in health:
+                st.markdown(f"- **Profitability:** {health['profitability']}")
+            if "balance_sheet" in health:
+                st.markdown(f"- **Balance Sheet:** {health['balance_sheet']}")
+
+    if "key_strengths" in analysis:
+        with st.expander("Key Strengths"):
+            for strength in analysis.get("key_strengths", []):
+                st.markdown(f"- {strength}")
+    
+    if "key_risks" in analysis:
+        with st.expander("Key Risks"):
+            for risk in analysis.get("key_risks", []):
+                st.markdown(f"- {risk}")
+
+    # Add other sections from the JSON if they exist
+    with st.expander("Show Detailed AI Output"):
+        st.json(analysis)
+
 def render_dashboard():
     st.set_page_config(page_title="Earnings Intelligence", page_icon="📊", layout="wide")
     st.title("📊 AI-Powered Earnings Intelligence Platform")
+    st.markdown("---")
+    st.info("Enter a stock ticker to get a comprehensive AI-generated earnings analysis.")
 
     c1, c2 = st.columns([0.7, 0.3])
     with c1:
@@ -450,10 +514,17 @@ def render_dashboard():
             st.warning("Please enter ticker symbol.")
             st.stop()
 
-        with st.spinner("🔄 Collecting earnings intelligence..."):
+        # IMPROVEMENT: Add more granular spinner messages
+        with st.spinner("🔄 Collecting SEC filings..."):
             sec_data, raw_responses = fetch_sec_earnings(ticker, quarters, debug=debug)
+        
+        with st.spinner("🎙️ Fetching earnings call transcripts..."):
             transcripts = fetch_earnings_transcripts(ticker, quarters)
+
+        with st.spinner("📰 Collecting analyst reports..."):
             analyst_data = fetch_analyst_sentiment(ticker)
+        
+        with st.spinner("📈 Fetching market data..."):
             market_data = fetch_market_data(ticker, days=90)
 
         # Tabs
@@ -499,13 +570,12 @@ def render_dashboard():
 
         with tab4:
             if market_data:
-                # Key metrics
-                st.metric("Current Price", format_currency(market_data.get("current_price", 0)))
-                st.metric("30-Day Change", f"{market_data.get('price_change_30d', 0):.1f}%")
-                st.metric("P/E Ratio", f"{market_data.get('pe_ratio', 'N/A')}")
-                st.metric("Market Cap", format_currency(market_data.get("market_cap", 0)))
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                col_m1.metric("Current Price", format_currency(market_data.get("current_price", 0)))
+                col_m2.metric("30-Day Change", f"{market_data.get('price_change_30d', 0):.1f}%")
+                col_m3.metric("P/E Ratio", f"{market_data.get('pe_ratio', 'N/A')}")
+                col_m4.metric("Market Cap", format_currency(market_data.get("market_cap", 0)))
 
-                # Stock price chart (Plotly)
                 ph = market_data.get("price_history", [])
                 dates = market_data.get("dates", [])
                 if ph and dates and len(ph) == len(dates):
@@ -535,7 +605,6 @@ def render_dashboard():
                 chart_df["x"] = pd.to_datetime(chart_df["filed_at"], errors="coerce")
             chart_df = chart_df.sort_values("x")
 
-            # Revenue / Net Income combined figure
             rev_df = chart_df.dropna(subset=["revenue","x"])[["x","revenue"]]
             ni_df = chart_df.dropna(subset=["net_income","x"])[["x","net_income"]]
             eps_df = chart_df.dropna(subset=["eps","x"])[["x","eps"]]
@@ -543,11 +612,20 @@ def render_dashboard():
             if not rev_df.empty or not ni_df.empty or not eps_df.empty:
                 fig = go.Figure()
                 if not rev_df.empty:
-                    fig.add_trace(go.Bar(x=rev_df["x"], y=rev_df["revenue"], name="Revenue", yaxis="y1"))
+                    fig.add_trace(go.Bar(
+                        x=rev_df["x"], y=rev_df["revenue"], name="Revenue", yaxis="y1",
+                        hovertemplate='Revenue: %{y:$.2s}<extra></extra>'
+                    ))
                 if not ni_df.empty:
-                    fig.add_trace(go.Bar(x=ni_df["x"], y=ni_df["net_income"], name="Net Income", yaxis="y1"))
+                    fig.add_trace(go.Bar(
+                        x=ni_df["x"], y=ni_df["net_income"], name="Net Income", yaxis="y1",
+                        hovertemplate='Net Income: %{y:$.2s}<extra></extra>'
+                    ))
                 if not eps_df.empty:
-                    fig.add_trace(go.Line(x=eps_df["x"], y=eps_df["eps"], name="EPS", yaxis="y2", marker=dict(symbol="diamond")))
+                    fig.add_trace(go.Line(
+                        x=eps_df["x"], y=eps_df["eps"], name="EPS", yaxis="y2", marker=dict(symbol="diamond"),
+                        hovertemplate='EPS: %{y:.2f}<extra></extra>'
+                    ))
                 # axes
                 fig.update_layout(
                     title="Revenue & Net Income (bars) and EPS (line)",
@@ -559,22 +637,11 @@ def render_dashboard():
 
         # AI analysis
         st.markdown("---")
-        st.header("🤖 AI Investment Analysis")
         with st.spinner("🧠 Generating comprehensive analysis..."):
             analysis = analyze_earnings_with_ai(ticker, sec_data, transcripts, analyst_data, market_data)
 
-        if analysis:
-            if isinstance(analysis, dict):
-                # show top metrics if present
-                grade = analysis.get("overall_grade", "N/A")
-                rec = analysis.get("recommendation", "N/A")
-                st.markdown(f"**Overall Grade:** {grade}  \n**Recommendation:** {rec}")
-                st.json(analysis)
-            else:
-                st.write("AI output (raw):")
-                st.write(analysis)
-        else:
-            st.warning("AI analysis could not be generated. Check raw SEC JSON & debug logs.")
+        # IMPROVEMENT: Use the new display function
+        display_analysis(analysis)
 
 if __name__ == "__main__":
     render_dashboard()
