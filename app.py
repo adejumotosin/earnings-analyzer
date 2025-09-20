@@ -1,4 +1,3 @@
-# app.py
 import os
 import json
 import math
@@ -11,6 +10,24 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple, Optional
+from bs4 import BeautifulSoup
+import pypdf
+import io
+import tempfile
+
+# RAG Libraries
+from langchain_community.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.docstore.document import Document
+
+# OCR Libraries
+from google.cloud import vision_v1
+import fitz  # PyMuPDF, used for converting PDF pages to images
 
 # -------------------------
 # Configuration & Setup
@@ -22,11 +39,22 @@ if not GEMINI_API_KEY:
     st.error("❌ Missing Gemini API key. Please set GEMINI_API_KEY in Streamlit secrets or env.")
     st.stop()
 
+if not SEC_API_KEY:
+    st.error("❌ Missing SEC API key. Please set SEC_API_KEY in Streamlit secrets or env.")
+    st.stop()
+
 try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     st.error(f"❌ Failed to configure Gemini API: {e}")
     st.stop()
+
+# Initialize Google Cloud Vision client
+try:
+    vision_client = vision_v1.ImageAnnotatorClient()
+except Exception as e:
+    st.error(f"❌ Failed to initialize Google Cloud Vision client. Make sure GOOGLE_APPLICATION_CREDENTIALS is set. Error: {e}")
+    vision_client = None
 
 # -------------------------
 # Utility helpers
@@ -35,10 +63,6 @@ def safe_get(d: Dict, k: str, default="N/A"):
     return d.get(k, default) if isinstance(d, dict) else default
 
 def parse_number(value: Any) -> Optional[float]:
-    """
-    Try to coerce various representations into a float.
-    Returns None if unable.
-    """
     if value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -55,10 +79,6 @@ def parse_number(value: Any) -> Optional[float]:
     return None
 
 def extract_fact_value(obj: Any) -> Optional[float]:
-    """
-    Extract numeric value from sec-api xbrl-to-json fact entry.
-    Handles dicts with 'value', lists, and scalars.
-    """
     if obj is None:
         return None
     if isinstance(obj, (int, float)) and not isinstance(obj, bool):
@@ -69,7 +89,6 @@ def extract_fact_value(obj: Any) -> Optional[float]:
         for k in ("val", "amount", "value"):
             if k in obj:
                 return parse_number(obj.get(k))
-        # try scanning nested dict values
         for v in obj.values():
             vnum = extract_fact_value(v)
             if vnum is not None:
@@ -85,14 +104,12 @@ def extract_fact_value(obj: Any) -> Optional[float]:
                 v = parse_number(item)
                 if v is not None:
                     return v
-        # fallback: parse first element
         return extract_fact_value(obj[0])
     if isinstance(obj, str):
         return parse_number(obj)
     return None
 
 def format_currency(value: Optional[float]) -> str:
-    """Formats a number into a readable currency string or returns 'N/A'."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "N/A"
     try:
@@ -107,7 +124,6 @@ def format_currency(value: Optional[float]) -> str:
         return "N/A"
 
 def safe_format(val: Any) -> str:
-    """Used for DataFrame display: converts to currency or 'N/A'."""
     try:
         num = None
         if isinstance(val, (int, float)):
@@ -117,20 +133,121 @@ def safe_format(val: Any) -> str:
         return format_currency(num) if num is not None else "N/A"
     except Exception:
         return "N/A"
+        
+@st.cache_data(ttl=3600)
+def get_filing_text(url: str, debug: bool = False) -> str:
+    """
+    Downloads and extracts text from a HTML or PDF filing URL.
+    Uses pypdf for text-based PDFs and Google Cloud Vision for image-based PDFs.
+    """
+    if not url:
+        return ""
+    
+    try:
+        response = requests.get(url, timeout=60, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        content = response.content
+
+        if url.lower().endswith(".htm"):
+            soup = BeautifulSoup(content, "html.parser")
+            for script_or_style in soup(["script", "style"]):
+                script_or_style.extract()
+            text = soup.get_text(separator=' ', strip=True)
+            return " ".join(text.split())
+
+        elif url.lower().endswith(".pdf"):
+            pdf_file_obj = io.BytesIO(content)
+            
+            # 1. Try to extract text with pypdf first
+            try:
+                reader = pypdf.PdfReader(pdf_file_obj)
+                full_text = ""
+                for page in reader.pages:
+                    full_text += page.extract_text() or "" + "\n"
+                
+                if full_text.strip():
+                    return full_text
+            except Exception as e:
+                if debug:
+                    st.warning(f"⚠️ pypdf failed (likely scanned PDF): {e}. Attempting OCR.")
+
+            # 2. Fallback to Google Cloud Vision API for OCR
+            if vision_client:
+                st.warning("⚠️ PDF has no embedded text. Running OCR with Google Cloud Vision.")
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                        tmp_file.write(content)
+                        tmp_file_path = tmp_file.name
+
+                    doc = fitz.open(tmp_file_path)
+                    ocr_text = ""
+                    for i, page in enumerate(doc):
+                        pix = page.get_pixmap()
+                        img_bytes = pix.tobytes("png")
+                        image = vision_v1.Image(content=img_bytes)
+                        
+                        response = vision_client.document_text_detection(image=image)
+                        
+                        if response.full_text_annotation and response.full_text_annotation.text:
+                            ocr_text += response.full_text_annotation.text + "\n"
+                    
+                    os.unlink(tmp_file_path)
+                    
+                    if ocr_text.strip():
+                        return ocr_text
+                    else:
+                        st.error("❌ Google Cloud Vision OCR failed to extract text.")
+                        return ""
+                
+                except Exception as e:
+                    if debug:
+                        st.error(f"❌ Google Cloud Vision API call failed: {e}")
+                    return ""
+            else:
+                st.warning("⚠️ Google Cloud Vision client not initialized. Cannot perform OCR.")
+                return ""
+
+        return ""
+
+    except Exception as e:
+        if debug:
+            st.error(f"Failed to download or parse filing from {url}: {e}")
+        return ""
 
 # -------------------------
-# SEC XBRL -> JSON fetcher - FIXED
+# RAG Pipeline Setup
+# -------------------------
+@st.cache_resource(ttl=3600)
+def prepare_rag_pipeline(filing_texts: List[str]):
+    """
+    Sets up a RAG pipeline from a list of filing texts.
+    Caches the vector store for faster subsequent runs.
+    """
+    if not filing_texts:
+        return None
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    all_chunks = []
+    for text in filing_texts:
+        chunks = text_splitter.split_text(text)
+        all_chunks.extend([Document(page_content=c) for c in chunks])
+
+    if not all_chunks:
+        st.warning("No text was extracted from the filings to build the RAG pipeline.")
+        return None
+
+    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vector_store = Chroma.from_documents(documents=all_chunks, embedding=embeddings_model)
+    
+    return vector_store.as_retriever(search_kwargs={"k": 5})
+
+# -------------------------
+# SEC Filing Text & Data Fetcher
 # -------------------------
 @st.cache_data(ttl=3600)
-def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> Tuple[List[Dict], Dict]:
+def fetch_sec_filings_and_narratives(ticker: str, quarters: int = 4, debug: bool = False) -> List[Dict]:
     filings_data: List[Dict] = []
-    raw_responses: Dict[str, Any] = {}
-
-    if not SEC_API_KEY:
-        if debug:
-            st.warning("⚠️ Missing SEC_API_KEY; cannot fetch SEC filings.")
-        return [], {}
-
+    
     query_url = "https://api.sec-api.io"
     payload = {
         "query": f"ticker:{ticker} AND formType:(\"10-Q\" OR \"10-K\")",
@@ -147,153 +264,41 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
     except Exception as e:
         if debug:
             st.error(f"❌ Could not query sec-api.io: {e}")
-        return [], {}
+        return []
 
     if not filings:
         if debug:
             st.info("No filings returned from sec-api.io for that ticker.")
-        return [], {}
+        return []
 
-    converter_endpoint = "https://api.sec-api.io/xbrl-to-json"
-
+    xbrl_converter_endpoint = "https://api.sec-api.io/xbrl-to-json"
+    
     for filing in filings:
-        filed_at = filing.get("filedAt")
-        form_type = filing.get("formType")
-        accession = filing.get("accessionNo")
-        link_xbrl = filing.get("linkToXbrl")
-        link_html = filing.get("linkToFilingDetails")
-        doc_files = filing.get("documentFormatFiles") or []
-
-        candidates = []
-        if link_xbrl:
-            candidates.append(("xbrl-url", link_xbrl))
-        for doc in doc_files:
-            url = doc.get("documentUrl") or doc.get("downloadUrl")
-            if url and isinstance(url, str) and url.lower().endswith(".xml"):
-                if ("xbrl-url", url) not in candidates:
-                    candidates.append(("xbrl-url", url))
-        if link_html:
-            candidates.append(("htm-url", link_html))
-        if accession:
-            candidates.append(("accession-no", accession))
-
         xbrl_json = None
-        used_param = None
-        for param_name, param_value in candidates:
-            try:
-                resp_conv = requests.get(converter_endpoint, params={param_name: param_value}, headers={"Authorization": SEC_API_KEY}, timeout=30)
-                if debug:
-                    st.write(f"🔎 DEBUG: Converter status for {param_name}={param_value}: {resp_conv.status_code}")
-                resp_conv.raise_for_status()
-                xbrl_json = resp_conv.json()
-                used_param = (param_name, param_value)
-                raw_responses[str(filed_at)] = xbrl_json
-                break
-            except Exception as e:
-                if debug:
-                    st.write(f"⚠️ DEBUG: Converter failed for {param_name}={param_value}: {e}")
-                xbrl_json = None
-                used_param = None
-                continue
+        filing_url = None
+        doc_files = filing.get("documentFormatFiles", [])
 
-        if not xbrl_json:
+        filing_url = next((doc.get("documentUrl") for doc in doc_files if doc.get("documentUrl", "").lower().endswith((".htm", ".html"))), None)
+        if not filing_url:
+            filing_url = next((doc.get("documentUrl") for doc in doc_files if doc.get("documentUrl", "").lower().endswith(".pdf")), None)
+        
+        try:
+            resp_xbrl = requests.get(xbrl_converter_endpoint, params={"accessionNo": filing.get("accessionNo")}, headers={"Authorization": SEC_API_KEY}, timeout=30)
+            resp_xbrl.raise_for_status()
+            xbrl_json = resp_xbrl.json()
+        except Exception as e:
             if debug:
-                st.warning(f"⚠️ No XBRL JSON for filing {form_type} at {filed_at}.")
-            continue
-
-        # --- FIX: Use a more robust search for specific XBRL concepts ---
-        facts = xbrl_json.get("facts", {})
-        revenue_keys = ["us-gaap:Revenues", "us-gaap:SalesRevenueNet", "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"]
-        net_income_keys = ["us-gaap:NetIncomeLoss", "us-gaap:ProfitLoss", "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic"]
-        eps_keys = ["us-gaap:EarningsPerShareDiluted", "us-gaap:EarningsPerShareBasic"]
-
-        revenue, net_income, eps_val = None, None, None
+                st.warning(f"⚠️ Could not convert filing to XBRL-JSON: {e}")
         
-        # Search for each metric using a prioritized list of keys
-        for key in revenue_keys:
-            if key in facts:
-                revenue = extract_fact_value(facts[key])
-                break
-        
-        for key in net_income_keys:
-            if key in facts:
-                net_income = extract_fact_value(facts[key])
-                break
-
-        for key in eps_keys:
-            if key in facts:
-                eps_val = extract_fact_value(facts[key])
-                break
-        
-        # --- FIX: Add a critical sanity check to prevent impossible data ---
-        if revenue is not None and net_income is not None and net_income > revenue:
-            if debug:
-                st.warning(f"⚠️ DEBUG: Detected impossible Net Income > Revenue for filing {filed_at}. Discarding Net Income value.")
-            net_income = None
-
         filings_data.append({
-            "filed_at": filed_at,
+            "filed_at": filing.get("filedAt"),
             "period": filing.get("periodOfReport"),
-            "type": form_type,
-            "revenue": revenue,
-            "eps": eps_val,
-            "net_income": net_income,
-            "accession_number": accession,
-            "xbrl_source_used": used_param
+            "type": filing.get("formType"),
+            "accession_number": filing.get("accessionNo"),
+            "filing_url": filing_url,
+            "full_xbrl_json": xbrl_json
         })
-    return filings_data, raw_responses
-
-# -------------------------
-# Simulated transcripts & analysts - IMPROVEMENT: Add example data for multiple tickers
-# -------------------------
-MOCK_DATA = {
-    "AAPL": {
-        "transcripts": [
-            {
-                "date": "2024-08-01", "quarter": "Q3 2024", "source": "SeekingAlpha",
-                "ceo_comments": [
-                    "We delivered strong results this quarter with revenue growth of 8% year-over-year.",
-                    "Our new product line is gaining significant traction in the market.",
-                ],
-                "key_metrics_discussed": ["User growth +12% QoQ", "Gross margins improved to 68%."]
-            },
-        ],
-        "analysts": [
-            {
-                "date": "2024-08-02", "firm": "Goldman Sachs", "rating": "Buy", "price_target": 180,
-                "headline": "Strong Q3 results support positive outlook",
-                "key_points": ["Revenue beat expectations by 3%", "New product line success."]
-            }
-        ]
-    },
-    "MSFT": {
-        "transcripts": [
-            {
-                "date": "2024-10-25", "quarter": "Q1 2025", "source": "Microsoft Investor Relations",
-                "ceo_comments": [
-                    "Strong demand for our cloud services drove significant top-line growth.",
-                    "AI integration across our product suite is a key differentiator."
-                ],
-                "key_metrics_discussed": ["Azure revenue growth +29% YoY", "Productivity & Business Processes up 15%."]
-            }
-        ],
-        "analysts": [
-            {
-                "date": "2024-10-26", "firm": "Morgan Stanley", "rating": "Overweight", "price_target": 450,
-                "headline": "Cloud strength remains a core driver",
-                "key_points": ["Solid earnings beat on both revenue and EPS.", "Guidance indicates continued cloud momentum."]
-            }
-        ]
-    }
-}
-
-@st.cache_data(ttl=3600)
-def fetch_earnings_transcripts(ticker: str, quarters: int = 2):
-    return MOCK_DATA.get(ticker.upper(), {}).get("transcripts", [])[:quarters]
-
-@st.cache_data(ttl=1800)
-def fetch_analyst_sentiment(ticker: str):
-    return MOCK_DATA.get(ticker.upper(), {}).get("analysts", [])
+    return filings_data
 
 # -------------------------
 # Market data (yfinance)
@@ -325,108 +330,131 @@ def fetch_market_data(ticker: str, days: int = 90):
         return {}
 
 # -------------------------
-# AI Analysis (Gemini) - IMPROVED PROMPT
+# AI Analysis (Gemini) - RAG-BASED
 # -------------------------
 @st.cache_data(ttl=7200)
-def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: List[Dict], analyst_reports: List[Dict], market_data: Dict):
+def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], market_data: Dict, retriever):
+    if not retriever:
+        st.error("No documents found for analysis. Please check your SEC filings.")
+        return {}
+    
+    numerical_data = []
+    for f in sec_filings:
+        xbrl_json = f.get("full_xbrl_json", {})
+        facts = xbrl_json.get("facts", {})
+        numerical_summary = {
+            "filed_at": f.get("filed_at"),
+            "period": f.get("period"),
+            "revenue": extract_fact_value(facts.get("us-gaap:Revenues")) or extract_fact_value(facts.get("us-gaap:SalesRevenueNet")),
+            "net_income": extract_fact_value(facts.get("us-gaap:NetIncomeLoss")),
+            "eps": extract_fact_value(facts.get("us-gaap:EarningsPerShareDiluted"))
+        }
+        numerical_data.append(numerical_summary)
+
+    questions = [
+        "What are the key drivers of financial performance?",
+        "What is the company's stated strategy for the future?",
+        "What are the most significant risk factors?",
+        "What forward-looking statements are made?"
+    ]
+    
+    retrieved_narrative = {}
+    for q in questions:
+        try:
+            docs = retriever.invoke(q)
+        except AttributeError:
+            # Fallback for older LangChain versions
+            docs = retriever.get_relevant_documents(q)
+        retrieved_narrative[q] = " ".join([doc.page_content for doc in docs])
+
     try:
-        filings_summary = []
-        for f in sec_filings:
-            filings_summary.append({
-                "filed_at": f.get("filed_at"),
-                "period": f.get("period"),
-                "type": f.get("type"),
-                "revenue": f.get("revenue"),
-                "eps": f.get("eps"),
-                "net_income": f.get("net_income")
-            })
+        prompt_template = f"""
+You are a professional financial analyst. Provide a comprehensive analysis based on the structured financial data and retrieved narrative excerpts below.
 
-        prompt = f"""
-You are a professional financial analyst. Based on the data below, produce a single, valid JSON object with the following keys.
-Only use information provided in the JSON data. Do not use specific numbers or percentages unless they are present in the provided JSON data.
+Use only the provided context. Do not use outside knowledge.
 
-1.  overall_grade: A single letter grade from A to F.
-2.  recommendation: A single word: "Buy", "Hold", or "Sell".
-3.  investment_thesis: A concise paragraph summarizing the core investment case.
-4.  financial_health: An object with keys 'revenue_trend' (describes growth), 'profitability' (discusses margins/net income), and 'balance_sheet' (discusses cash/debt).
-5.  key_strengths: A list of 2-3 key positive factors.
-6.  key_risks: A list of 2-3 key negative factors or risks.
-7.  analyst_consensus: A summary of analyst sentiment.
-8.  earnings_surprises: A summary of how the company performed against expectations.
+Structured Financial Data (from XBRL):
+{json.dumps(numerical_data, indent=2)}
 
-SEC_FILINGS_SUMMARY = {json.dumps(filings_summary)}
-TRANSCRIPTS = {json.dumps(transcripts)}
-ANALYSTS = {json.dumps(analyst_reports)}
-MARKET = {json.dumps({'current_price': market_data.get('current_price'), 'pe_ratio': market_data.get('pe_ratio'), 'market_cap': market_data.get('market_cap')})}
+Market Data:
+{json.dumps(market_data, indent=2)}
 
-Return ONLY the JSON object, nothing else.
+Narrative Excerpts from SEC Filings (Retrieved via RAG):
+{json.dumps(retrieved_narrative, indent=2)}
+
+Your analysis must cover the following points:
+1.  **Financial Performance and Trends:**
+    * Describe the revenue and profitability trends using the structured data.
+    * Explain the key drivers behind these trends based on the narrative.
+
+2.  **Strategic Insights & Outlook:**
+    * Summarize the company's strategy and future plans based on the narrative.
+    * Identify any key forward-looking statements or projections.
+
+3.  **Key Risks:**
+    * Identify and summarize the most significant risk factors described in the narrative.
+
+4.  **Overall Assessment:**
+    * Provide a final investment thesis.
+    * Assign a letter grade (A-F, where A is excellent, F is poor) and a recommendation (Buy, Hold, or Sell).
+
+Respond with a single JSON object with the keys: 'financial_performance', 'strategic_insights', 'key_risks', and 'overall_assessment'. The 'overall_assessment' should be a nested object with 'investment_thesis', 'overall_grade', and 'recommendation'.
 """
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
-        )
-
-        text = response.text
-        return json.loads(text)
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+        
+        response = llm.invoke(prompt_template)
+        
+        return json.loads(response.content)
     except json.JSONDecodeError as e:
-        st.error(f"⚠️ AI analysis failed to return valid JSON: {e}. Raw (truncated): {text[:2000] if 'text' in locals() else 'NO RESPONSE'}")
+        st.error(f"⚠️ AI analysis failed to return valid JSON: {e}. Raw (truncated): {response.content[:2000] if 'response' in locals() else 'NO RESPONSE'}")
         return {}
     except Exception as e:
         st.error(f"⚠️ AI analysis failed: {e}")
         return {}
 
+
 # -------------------------
 # Dashboard Rendering & UI
 # -------------------------
 def display_analysis(analysis: Dict):
-    """IMPROVEMENT: Function to display the AI analysis in a clean format."""
     if not analysis:
         st.warning("AI analysis data is missing or incomplete.")
         return
 
-    st.markdown("### 🤖 AI Investment Analysis")
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        grade = analysis.get("overall_grade", "N/A")
-        rec = analysis.get("recommendation", "N/A")
-        st.metric("Overall Grade", grade)
-        st.metric("Recommendation", rec)
+    st.markdown("### 🤖 Detailed AI Financial Analysis")
 
-    with col2:
-        if "investment_thesis" in analysis:
-            st.markdown(f"**Investment Thesis:**\n> {analysis['investment_thesis']}")
+    if "overall_assessment" in analysis:
+        final_summary = analysis["overall_assessment"]
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            grade = final_summary.get("overall_grade", "N/A")
+            rec = final_summary.get("recommendation", "N/A")
+            st.metric("Overall Grade", grade)
+            st.metric("Recommendation", rec)
+        with col2:
+            thesis = final_summary.get("investment_thesis", "N/A")
+            st.markdown(f"**Investment Thesis:**\n> {thesis}")
 
-    if "financial_health" in analysis:
-        st.markdown("#### Financial Health")
-        health = analysis["financial_health"]
-        if isinstance(health, dict):
-            if "revenue_trend" in health:
-                st.markdown(f"- **Revenue Trend:** {health['revenue_trend']}")
-            if "profitability" in health:
-                st.markdown(f"- **Profitability:** {health['profitability']}")
-            if "balance_sheet" in health:
-                st.markdown(f"- **Balance Sheet:** {health['balance_sheet']}")
+    if "financial_performance" in analysis:
+        st.markdown("#### Financial Performance and Trends")
+        st.markdown(analysis.get("financial_performance", "N/A"))
 
-    if "key_strengths" in analysis:
-        with st.expander("Key Strengths"):
-            for strength in analysis.get("key_strengths", []):
-                st.markdown(f"- {strength}")
-    
+    if "strategic_insights" in analysis:
+        st.markdown("#### Strategic Insights & Outlook")
+        st.markdown(analysis.get("strategic_insights", "N/A"))
+        
     if "key_risks" in analysis:
-        with st.expander("Key Risks"):
-            for risk in analysis.get("key_risks", []):
-                st.markdown(f"- {risk}")
-
-    with st.expander("Show Detailed AI Output"):
+        st.markdown("#### Key Risks")
+        st.markdown(analysis.get("key_risks", "N/A"))
+        
+    with st.expander("Show Raw AI Output"):
         st.json(analysis)
 
 def render_dashboard():
     st.set_page_config(page_title="Earnings Intelligence", page_icon="📊", layout="wide")
     st.title("📊 AI-Powered Earnings Intelligence Platform")
     st.markdown("---")
-    st.info("Enter a stock ticker to get a comprehensive AI-generated earnings analysis.")
+    st.info("Enter a stock ticker to get a comprehensive AI-generated earnings analysis based on SEC filing narratives.")
 
     c1, c2 = st.columns([0.7, 0.3])
     with c1:
@@ -441,60 +469,52 @@ def render_dashboard():
             st.warning("Please enter ticker symbol.")
             st.stop()
 
-        with st.spinner("🔄 Collecting SEC filings..."):
-            sec_data, raw_responses = fetch_sec_earnings(ticker, quarters, debug=debug)
-        
-        with st.spinner("🎙️ Fetching earnings call transcripts..."):
-            transcripts = fetch_earnings_transcripts(ticker, quarters)
+        with st.spinner("🔄 Collecting SEC filings and data..."):
+            sec_data = fetch_sec_filings_and_narratives(ticker, quarters, debug=debug)
+            
+        with st.spinner("📝 Extracting text from filings and building RAG pipeline..."):
+            filing_texts = [get_filing_text(f["filing_url"], debug=debug) for f in sec_data if f["filing_url"]]
+            retriever = prepare_rag_pipeline(filing_texts)
 
-        with st.spinner("📰 Collecting analyst reports..."):
-            analyst_data = fetch_analyst_sentiment(ticker)
-        
         with st.spinner("📈 Fetching market data..."):
             market_data = fetch_market_data(ticker, days=90)
-
-        # Tabs
+            
         st.subheader("Source Data Overview")
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 SEC Filings", "🎙️ Transcripts", "📰 Analysts", "📈 Market"])
+        tab1, tab2, tab3 = st.tabs(["📋 SEC Filings", "📝 Extracted Narrative", "📈 Market"])
 
         with tab1:
             if sec_data:
-                df = pd.DataFrame(sec_data)
-                for col in ("revenue","net_income","eps"):
-                    if col in df.columns:
-                        df[col] = df[col].apply(lambda x: safe_format(x))
-                st.dataframe(df, use_container_width=True)
-
-                with st.expander("🔎 Show Raw SEC JSON (Debug)"):
-                    st.write("Raw converter responses (by filing date):")
-                    st.json(raw_responses)
+                table_data = []
+                for f in sec_data:
+                    xbrl_facts = f.get("full_xbrl_json", {}).get("facts", {})
+                    revenue = extract_fact_value(xbrl_facts.get("us-gaap:Revenues")) or extract_fact_value(xbrl_facts.get("us-gaap:SalesRevenueNet"))
+                    net_income = extract_fact_value(xbrl_facts.get("us-gaap:NetIncomeLoss"))
+                    eps = extract_fact_value(xbrl_facts.get("us-gaap:EarningsPerShareDiluted"))
+                    table_data.append({
+                        "filed_at": f.get("filed_at"),
+                        "period": f.get("period"),
+                        "type": f.get("type"),
+                        "revenue": safe_format(revenue),
+                        "net_income": safe_format(net_income),
+                        "eps": safe_format(eps)
+                    })
+                st.dataframe(pd.DataFrame(table_data), use_container_width=True)
             else:
                 st.info("No SEC filing data available.")
 
         with tab2:
-            if transcripts:
-                for t in transcripts:
-                    with st.expander(f"{t.get('quarter')} — {t.get('date')} ({t.get('source')})"):
-                        st.write("CEO comments:")
-                        for c in t.get("ceo_comments", []):
-                            st.write(f"- {c}")
-                        st.write("Key metrics:")
-                        for m in t.get("key_metrics_discussed", []):
-                            st.write(f"- {m}")
+            if sec_data:
+                for filing in sec_data:
+                    with st.expander(f"Narrative from {filing['type']} ({filing['filed_at']})"):
+                        filing_text = get_filing_text(filing["filing_url"], debug=debug)
+                        if not filing_text:
+                            st.info("No text extracted from this filing.")
+                        else:
+                            st.text_area("Extracted Text (Truncated)", value=filing_text[:5000] + "...", height=300)
             else:
-                st.info("No transcripts.")
-
+                st.info("No narrative text available.")
+        
         with tab3:
-            if analyst_data:
-                for a in analyst_data:
-                    with st.expander(f"{a.get('firm')} — {a.get('rating')}"):
-                        st.write(a.get("headline"))
-                        for p in a.get("key_points", a.get("key_points", [])):
-                            st.write(f"- {p}")
-            else:
-                st.info("No analyst reports.")
-
-        with tab4:
             if market_data:
                 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                 col_m1.metric("Current Price", format_currency(market_data.get("current_price", 0)))
@@ -511,57 +531,10 @@ def render_dashboard():
                     st.plotly_chart(fig_price, use_container_width=True)
             else:
                 st.info("No market data.")
-
-        numeric_rows = []
-        for f in sec_data:
-            numeric_rows.append({
-                "filed_at": f.get("filed_at"),
-                "period": f.get("period"),
-                "revenue": f.get("revenue"),
-                "net_income": f.get("net_income"),
-                "eps": f.get("eps")
-            })
-
-        if numeric_rows:
-            chart_df = pd.DataFrame(numeric_rows)
-            if "period" in chart_df.columns and chart_df["period"].notna().any():
-                chart_df["x"] = pd.to_datetime(chart_df["period"], errors="coerce")
-            else:
-                chart_df["x"] = pd.to_datetime(chart_df["filed_at"], errors="coerce")
-            chart_df = chart_df.sort_values("x")
-
-            rev_df = chart_df.dropna(subset=["revenue","x"])[["x","revenue"]]
-            ni_df = chart_df.dropna(subset=["net_income","x"])[["x","net_income"]]
-            eps_df = chart_df.dropna(subset=["eps","x"])[["x","eps"]]
-
-            if not rev_df.empty or not ni_df.empty or not eps_df.empty:
-                fig = go.Figure()
-                if not rev_df.empty:
-                    fig.add_trace(go.Bar(
-                        x=rev_df["x"], y=rev_df["revenue"], name="Revenue", yaxis="y1",
-                        hovertemplate='Revenue: %{y:$.2s}<extra></extra>'
-                    ))
-                if not ni_df.empty:
-                    fig.add_trace(go.Bar(
-                        x=ni_df["x"], y=ni_df["net_income"], name="Net Income", yaxis="y1",
-                        hovertemplate='Net Income: %{y:$.2s}<extra></extra>'
-                    ))
-                if not eps_df.empty:
-                    fig.add_trace(go.Line(
-                        x=eps_df["x"], y=eps_df["eps"], name="EPS", yaxis="y2", marker=dict(symbol="diamond"),
-                        hovertemplate='EPS: %{y:.2f}<extra></extra>'
-                    ))
-                fig.update_layout(
-                    title="Revenue & Net Income (bars) and EPS (line)",
-                    xaxis=dict(title="Period"),
-                    yaxis=dict(title="Amount (USD)", tickprefix="$"),
-                    yaxis2=dict(title="EPS", overlaying="y", side="right")
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
+        
         st.markdown("---")
         with st.spinner("🧠 Generating comprehensive analysis..."):
-            analysis = analyze_earnings_with_ai(ticker, sec_data, transcripts, analyst_data, market_data)
+            analysis = analyze_earnings_with_ai(ticker, sec_data, market_data, retriever)
 
         display_analysis(analysis)
 
