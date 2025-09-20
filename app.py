@@ -98,15 +98,32 @@ def fetch_sec_earnings(ticker, quarters=4):
                 xbrl_filename = f"{ticker.lower()}-{filing.get('periodOfReport', '').replace('-', '')}.htm"
                 xbrl_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number}/{xbrl_filename}"
             
-            # Use the XBRL-to-JSON Converter API
-            converter_url = "https://api.sec-api.io/xbrl-to-json"
+            # Step 2: For each filing, extract financial data
+for filing in filings:
+    try:
+        # Method 1: Try to get the XBRL document URL directly
+        xbrl_url = filing.get("documentFormatFiles", [{}])[0].get("documentUrl", "")
+        
+        if not xbrl_url or not xbrl_url.endswith('.xml'):
+            accession_number = filing.get("accessionNo", "").replace("-", "")
+            cik = filing.get("cik", "")
+            form_type = filing.get("formType", "").lower()
             
-            xbrl_response = requests.get(
-                converter_url, 
-                params={"url": xbrl_url}, 
-                headers={"Authorization": api_key},
-                timeout=30
-            )
+            # Construct fallback XBRL URL
+            xbrl_filename = f"{ticker.lower()}-{filing.get('periodOfReport', '').replace('-', '')}.htm"
+            xbrl_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number}/{xbrl_filename}"
+        
+        # 🔎 DEBUG LOG
+        st.write(f"🔎 DEBUG: Trying XBRL URL → {xbrl_url}")
+        
+        # Use the XBRL-to-JSON Converter API
+        converter_url = "https://api.sec-api.io/xbrl-to-json"
+        xbrl_response = requests.get(
+            converter_url, 
+            params={"url": xbrl_url}, 
+            headers={"Authorization": api_key},
+            timeout=30
+        )
             xbrl_response.raise_for_status()
             data = xbrl_response.json()
             
