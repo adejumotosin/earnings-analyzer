@@ -1,580 +1,288 @@
-# app.py
 import os
+import re
 import json
-import math
 import requests
 import pandas as pd
 import streamlit as st
+from bs4 import BeautifulSoup
 import google.generativeai as genai
 import yfinance as yf
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple, Optional
+import plotly.graph_objects as go
 
-# -------------------------
-# Configuration & Setup
-# -------------------------
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
-SEC_API_KEY = st.secrets.get("SEC_API_KEY") or os.environ.get("SEC_API_KEY")
-
-if not GEMINI_API_KEY:
-    st.error("❌ Missing Gemini API key. Please set GEMINI_API_KEY in Streamlit secrets or env.")
+# --- Configuration & Setup ---
+# Configure AI
+api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    st.error("❌ Missing Gemini API key. Please set it in your Streamlit secrets.")
     st.stop()
 
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=api_key)
 except Exception as e:
     st.error(f"❌ Failed to configure Gemini API: {e}")
     st.stop()
 
-# -------------------------
-# Utility helpers
-# -------------------------
-def safe_get(d: Dict, k: str, default="N/A"):
-    return d.get(k, default) if isinstance(d, dict) else default
+# --- Utility Functions ---
+def safe_get(data, key, default="N/A"):
+    return data.get(key, default)
 
-def parse_number(value: Any) -> Optional[float]:
-    """
-    Try to coerce various representations into a float.
-    Returns None if unable.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    if isinstance(value, str):
-        s = value.strip().replace(",", "")
-        sign = -1 if ("(" in s and ")" in s) else 1
-        s = s.replace("(", "").replace(")", "").replace("$", "")
-        token = s.split()[0] if s.split() else s
-        try:
-            return sign * float(token)
-        except Exception:
-            return None
-    return None
-
-def extract_fact_value(obj: Any) -> Optional[float]:
-    """
-    Extract numeric value from sec-api xbrl-to-json fact entry.
-    Handles dicts with 'value', lists, and scalars.
-    """
-    if obj is None:
-        return None
-    if isinstance(obj, (int, float)) and not isinstance(obj, bool):
-        return float(obj)
-    if isinstance(obj, dict):
-        if "value" in obj:
-            return parse_number(obj.get("value"))
-        for k in ("val", "amount", "value"):
-            if k in obj:
-                return parse_number(obj.get(k))
-        # try scanning nested dict values
-        for v in obj.values():
-            vnum = extract_fact_value(v)
-            if vnum is not None:
-                return vnum
-        return None
-    if isinstance(obj, list) and obj:
-        for item in reversed(obj):
-            if isinstance(item, dict) and "value" in item:
-                return parse_number(item.get("value"))
-            if isinstance(item, (int, float)):
-                return float(item)
-            if isinstance(item, str):
-                v = parse_number(item)
-                if v is not None:
-                    return v
-        # fallback: parse first element
-        return extract_fact_value(obj[0])
-    if isinstance(obj, str):
-        return parse_number(obj)
-    return None
-
-def format_currency(value: Optional[float]) -> str:
-    """Formats a number into a readable currency string or returns 'N/A'."""
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return "N/A"
+def safe_format(value):
     try:
-        if value >= 1e12:
-            return f"${value / 1e12:.2f}T"
-        if value >= 1e9:
-            return f"${value / 1e9:.2f}B"
-        if value >= 1e6:
-            return f"${value / 1e6:.2f}M"
-        return f"${value:,.2f}"
+        if value is None:
+            return "N/A"
+        if isinstance(value, (int, float)):
+            if value >= 1e12:
+                return f"${value / 1e12:.2f}T"
+            elif value >= 1e9:
+                return f"${value / 1e9:.2f}B"
+            elif value >= 1e6:
+                return f"${value / 1e6:.2f}M"
+            return f"${value:,.2f}"
+        return str(value)
     except Exception:
-        return "N/A"
+        return str(value)
 
-def safe_format(val: Any) -> str:
-    """Used for DataFrame display: converts to currency or 'N/A'."""
-    try:
-        num = None
-        if isinstance(val, (int, float)):
-            num = float(val)
-        else:
-            num = parse_number(val)
-        return format_currency(num) if num is not None else "N/A"
-    except Exception:
-        return "N/A"
-
-# -------------------------
-# SEC XBRL -> JSON fetcher
-# -------------------------
+# --- Data Fetching Functions ---
 @st.cache_data(ttl=3600, show_spinner="📋 Fetching SEC filings...")
-def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> Tuple[List[Dict], Dict]:
+def fetch_sec_earnings(ticker, quarters=4):
     """
-    Returns (filings_list, raw_responses).
-    filings_list: list of dicts with keys: filed_at, period, type, revenue (float/None), eps (float/None), net_income (float/None), accession_number, xbrl_source_used
-    raw_responses: mapping filed_at -> raw JSON returned by the converter (for debugging)
+    Fetch financial data from sec-api.io using linkToXbrl or accession number.
     """
-    filings_data: List[Dict] = []
-    raw_responses: Dict[str, Any] = {}
+    filings_data = []
 
-    if not SEC_API_KEY:
-        if debug:
-            st.warning("⚠️ Missing SEC_API_KEY; cannot fetch SEC filings.")
-        return [], {}
+    api_key = st.secrets.get("SEC_API_KEY") or os.environ.get("SEC_API_KEY")
+    if not api_key:
+        st.error("❌ Missing SEC API key. Please set it in your Streamlit secrets.")
+        return []
 
-    # Query sec-api.io for filings
     query_url = "https://api.sec-api.io"
     payload = {
         "query": f"ticker:{ticker} AND formType:(\"10-Q\" OR \"10-K\")",
         "from": "0",
         "size": quarters,
-        "sort": [{"filedAt": {"order": "desc"}}]
+        "sort": [{"filedAt": {"order": "desc"}}],
     }
-    headers = {"Content-Type": "application/json", "Authorization": SEC_API_KEY}
+    headers = {"Content-Type": "application/json", "Authorization": api_key}
 
     try:
-        resp = requests.post(query_url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        filings = resp.json().get("filings", [])
-    except Exception as e:
-        if debug:
-            st.error(f"❌ Could not query sec-api.io: {e}")
-        return [], {}
+        query_response = requests.post(query_url, json=payload, headers=headers)
+        query_response.raise_for_status()
+        filings = query_response.json().get("filings", [])
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Failed to fetch filing metadata: {e}")
+        return []
 
     if not filings:
-        if debug:
-            st.info("No filings returned from sec-api.io for that ticker.")
-        return [], {}
-
-    converter_endpoint = "https://api.sec-api.io/xbrl-to-json"
+        st.info(f"No 10-Q or 10-K filings found for {ticker}.")
+        return []
 
     for filing in filings:
-        filed_at = filing.get("filedAt")
+        filing_date = filing.get("filedAt")
         form_type = filing.get("formType")
-        accession = filing.get("accessionNo")
-        link_xbrl = filing.get("linkToXbrl")
-        link_html = filing.get("linkToFilingDetails")
-        doc_files = filing.get("documentFormatFiles") or []
+        filing_html = filing.get("linkToFilingDetails")
+        accession_no = filing.get("accessionNo")
 
-        # Build candidate param list following docs: xbrl-url -> htm-url -> accession-no
-        candidates = []
-        if link_xbrl:
-            candidates.append(("xbrl-url", link_xbrl))
-        # Extract any .xml in documentFormatFiles
-        for doc in doc_files:
-            url = doc.get("documentUrl") or doc.get("downloadUrl")
-            if url and isinstance(url, str) and url.lower().endswith(".xml"):
-                if ("xbrl-url", url) not in candidates:
-                    candidates.append(("xbrl-url", url))
-        if link_html:
-            candidates.append(("htm-url", link_html))
-        if accession:
-            candidates.append(("accession-no", accession))
+        st.write(f"🔎 DEBUG: Filing {form_type} filedAt={filing_date} candidates:")
+        if filing_html:
+            st.write(f"• htm-url: {filing_html}")
+        if accession_no:
+            st.write(f"• accession-no: {accession_no}")
 
-        if debug:
-            st.write(f"🔎 DEBUG: Filing {form_type} filedAt={filed_at} candidates:")
-            for k, v in candidates:
-                st.write(f"  • {k}: {v}")
+        target_url = None
+        params = {}
+        if filing_html:
+            target_url = filing_html
+            params = {"htm-url": target_url}
+        elif accession_no:
+            target_url = accession_no
+            params = {"accession-no": accession_no}
+        else:
+            continue
 
-        xbrl_json = None
-        used_param = None
-        for param_name, param_value in candidates:
-            try:
-                resp_conv = requests.get(converter_endpoint, params={param_name: param_value}, headers={"Authorization": SEC_API_KEY}, timeout=30)
-                if debug:
-                    st.write(f"🔎 DEBUG: Converter status for {param_name}={param_value}: {resp_conv.status_code}")
-                resp_conv.raise_for_status()
-                xbrl_json = resp_conv.json()
-                used_param = (param_name, param_value)
-                raw_responses[str(filed_at)] = xbrl_json
-                break
-            except Exception as e:
-                if debug:
-                    st.write(f"⚠️ DEBUG: Converter failed for {param_name}={param_value}: {e}")
-                xbrl_json = None
-                used_param = None
+        try:
+            xbrl_url = "https://api.sec-api.io/xbrl-to-json"
+            xbrl_response = requests.get(
+                xbrl_url, params=params, headers={"Authorization": api_key}
+            )
+            st.write(
+                f"🔎 DEBUG: Converter status for {list(params.keys())[0]}={target_url}: {xbrl_response.status_code}"
+            )
+            xbrl_response.raise_for_status()
+            data = xbrl_response.json()
+
+            income_statements = data.get("incomeStatement", [])
+            if not income_statements:
+                st.warning(f"⚠️ No income statement data for filing {target_url}")
                 continue
 
-        if not xbrl_json:
-            if debug:
-                st.warning(f"⚠️ No XBRL JSON for filing {form_type} at {filed_at}.")
+            last_statement = income_statements[-1]
+            revenue, net_income, eps = None, None, None
+
+            for fact in last_statement:
+                if fact.get("concept") == "Revenues":
+                    revenue = fact.get("value")
+                elif fact.get("concept") == "NetIncomeLoss":
+                    net_income = fact.get("value")
+                elif fact.get("concept") == "EarningsPerShareDiluted":
+                    eps = fact.get("value")
+
+            filings_data.append(
+                {
+                    "filed_at": filing_date,
+                    "period": filing.get("periodOfReport"),
+                    "type": form_type,
+                    "revenue": revenue,
+                    "eps": eps,
+                    "net_income": net_income,
+                    "accession_number": accession_no,
+                    "xbrl_source_used": list(params.keys())[0],
+                    "xbrl_url": target_url,
+                }
+            )
+
+        except requests.exceptions.RequestException as e:
+            st.warning(f"⚠️ Failed to parse filing {target_url}: {e}")
             continue
 
-        # Look for income statement data under a number of possible keys
-        possible_keys = ["StatementsOfIncome", "StatementsOfOperations", "incomeStatement", "IncomeStatements", "StatementOfIncome", "ComprehensiveIncomeStatement"]
-        income_block = None
-        for key in possible_keys:
-            if key in xbrl_json:
-                income_block = xbrl_json[key]
-                break
+    return filings_data
 
-        # If not found, try 'facts' as last resort
-        if income_block is None:
-            facts = xbrl_json.get("facts") or {}
-            rev = None
-            ni = None
-            eps_val = None
-            for concept_key, concept_value in facts.items():
-                low = concept_key.lower()
-                if "revenue" in low and rev is None:
-                    rev = extract_fact_value(concept_value)
-                if "netincome" in low and ni is None:
-                    ni = extract_fact_value(concept_value)
-                if ("earningspershare" in low or "eps" in low) and eps_val is None:
-                    eps_val = extract_fact_value(concept_value)
-            filings_data.append({
-                "filed_at": filed_at,
-                "period": filing.get("periodOfReport"),
-                "type": form_type,
-                "revenue": rev,
-                "eps": eps_val,
-                "net_income": ni,
-                "accession_number": accession,
-                "xbrl_source_used": used_param
-            })
-            continue
-
-        # Normalize income_block
-        chosen_statement = None
-        if isinstance(income_block, list) and len(income_block) > 0:
-            for item in reversed(income_block):
-                if isinstance(item, dict) and any(k.lower() in map(str.lower, item.keys()) for k in ("Revenues", "NetIncomeLoss", "EarningsPerShareDiluted")):
-                    chosen_statement = item
-                    break
-            if chosen_statement is None:
-                chosen_statement = income_block[-1]
-        elif isinstance(income_block, dict):
-            chosen_statement = income_block
-        else:
-            if debug:
-                st.warning(f"⚠️ Unexpected format for income block in filing {filed_at}: {type(income_block)}")
-            continue
-
-        revenue_raw = None
-        net_income_raw = None
-        eps_raw = None
-
-        if isinstance(chosen_statement, dict):
-            for key in ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "TotalRevenue"):
-                if key in chosen_statement and revenue_raw is None:
-                    revenue_raw = chosen_statement.get(key)
-            for key in ("NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"):
-                if key in chosen_statement and net_income_raw is None:
-                    net_income_raw = chosen_statement.get(key)
-            for key in ("EarningsPerShareDiluted", "EarningsPerShareBasic", "EarningsPerShare"):
-                if key in chosen_statement and eps_raw is None:
-                    eps_raw = chosen_statement.get(key)
-
-            if revenue_raw is None or net_income_raw is None or eps_raw is None:
-                for k, v in chosen_statement.items():
-                    low = k.lower()
-                    if revenue_raw is None and ("revenue" in low or "sales" in low):
-                        revenue_raw = revenue_raw or v
-                    if net_income_raw is None and ("netincome" in low or "profit" in low):
-                        net_income_raw = net_income_raw or v
-                    if eps_raw is None and ("earningspershare" in low or "eps" in low):
-                        eps_raw = eps_raw or v
-
-        if isinstance(chosen_statement, list):
-            for fact in reversed(chosen_statement):
-                concept = fact.get("concept") or ""
-                val = fact.get("value") if isinstance(fact, dict) else fact
-                low = concept.lower()
-                if revenue_raw is None and ("revenue" in low or "sales" in low):
-                    revenue_raw = val
-                if net_income_raw is None and ("netincome" in low or "profitloss" in low or "profit" in low):
-                    net_income_raw = val
-                if eps_raw is None and ("earningspershare" in low or "eps" in low):
-                    eps_raw = val
-
-        revenue = extract_fact_value(revenue_raw)
-        net_income = extract_fact_value(net_income_raw)
-        eps_val = extract_fact_value(eps_raw)
-
-        filings_data.append({
-            "filed_at": filed_at,
-            "period": filing.get("periodOfReport"),
-            "type": form_type,
-            "revenue": revenue,
-            "eps": eps_val,
-            "net_income": net_income,
-            "accession_number": accession,
-            "xbrl_source_used": used_param
-        })
-
-    return filings_data, raw_responses
-
-# -------------------------
-# Simulated transcripts & analysts
-# -------------------------
-@st.cache_data(ttl=3600, show_spinner="🎙️ Fetching earnings call transcripts...")
-def fetch_earnings_transcripts(ticker: str, quarters: int = 2):
-    sample = {
-        "date": "2024-10-30",
-        "quarter": "Q3 2024",
-        "source": "SeekingAlpha",
-        "ceo_comments": [
-            "We delivered strong results this quarter with revenue growth of 8% year-over-year",
-            "Our new product line is gaining significant traction in the market",
-        ],
-        "key_metrics_discussed": [
-            "User growth +12% QoQ",
-            "Gross margins improved to 68%",
-        ],
-    }
-    return [sample][:quarters]
-
-@st.cache_data(ttl=1800, show_spinner="📰 Collecting analyst reports...")
-def fetch_analyst_sentiment(ticker: str):
-    return [
-        {
-            "date": "2024-11-01",
-            "firm": "Goldman Sachs",
-            "rating": "Buy",
-            "price_target": 180,
-            "headline": "Strong Q3 results support positive outlook",
-            "key_points": ["Revenue beat expectations by 3%"]
-        }
-    ]
-
-# -------------------------
-# Market data (yfinance)
-# -------------------------
-@st.cache_data(ttl=300, show_spinner="📈 Fetching market data...")
-def fetch_market_data(ticker: str, days: int = 90):
+def fetch_market_data(ticker):
+    end = datetime.today()
+    start = end - timedelta(days=90)
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info if hasattr(stock, "info") else {}
-        end = datetime.now()
-        start = end - timedelta(days=days)
-        hist = stock.history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
-        if hist.empty:
-            return {}
-        current_price = float(hist["Close"].iloc[-1])
-        price_change_30d = ((current_price - float(hist["Close"].iloc[-30])) / float(hist["Close"].iloc[-30]) * 100) if len(hist) >= 30 else 0.0
-        avg_vol = float(hist["Volume"].mean()) if "Volume" in hist.columns else 0.0
-        return {
-            "current_price": current_price,
-            "market_cap": info.get("marketCap", 0),
-            "pe_ratio": info.get("trailingPE", 0),
-            "price_change_30d": price_change_30d,
-            "avg_volume": avg_vol,
-            "price_history": hist["Close"].tolist()[-90:],
-            "dates": [d.strftime("%Y-%m-%d") for d in hist.index.tolist()[-90:]]
-        }
+        df = yf.download(ticker, start=start, end=end, progress=False)
+        return df
     except Exception as e:
-        st.warning(f"⚠️ Market data fetch failed: {e}")
-        return {}
+        st.warning(f"⚠️ Failed to fetch market data for {ticker}: {e}")
+        return pd.DataFrame()
 
-# -------------------------
-# AI Analysis (Gemini) - summarized context only
-# -------------------------
-@st.cache_data(ttl=7200, show_spinner="🤖 Generating AI analysis...")
-def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: List[Dict], analyst_reports: List[Dict], market_data: Dict):
+# --- AI Analysis Function ---
+def analyze_with_ai(context):
     """
-    Build a compact summary of SEC filings (dates + numeric metrics) and send it to Gemini.
-    Expect JSON back; handle parse errors gracefully.
+    Send context to Gemini AI and get structured analysis.
     """
+    prompt = f"""
+    Analyze the following company earnings and market context.
+    Provide JSON with fields:
+    overall_grade, investment_thesis, financial_health, key_strengths, key_risks, recommendation.
+
+    Context:
+    {context}
+    """
+
     try:
-        filings_summary = []
-        for f in sec_filings:
-            filings_summary.append({
-                "filed_at": f.get("filed_at"),
-                "period": f.get("period"),
-                "type": f.get("type"),
-                "revenue": f.get("revenue"),
-                "eps": f.get("eps"),
-                "net_income": f.get("net_income")
-            })
-
-        prompt = f"""
-You are a professional financial analyst. Based on the data below produce a single valid JSON object with keys:
-overall_grade, investment_thesis, financial_health (revenue_trend, profitability, balance_sheet),
-key_strengths (list), key_risks (list), analyst_consensus (avg_rating, price_target_range, sentiment_shift),
-earnings_surprises (revenue_beat_miss, eps_beat_miss, guidance_reaction), competitive_position, valuation_assessment,
-price_catalysts (list), recommendation, risk_level.
-
-SEC_FILINGS_SUMMARY = {json.dumps(filings_summary)}
-TRANSCRIPTS = {json.dumps(transcripts)}
-ANALYSTS = {json.dumps(analyst_reports)}
-MARKET = {json.dumps({'current_price': market_data.get('current_price'), 'pe_ratio': market_data.get('pe_ratio'), 'market_cap': market_data.get('market_cap')})}
-
-Return ONLY the JSON object, no additional text.
-"""
         model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
-        )
-
-        text = response.text
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        st.error(f"⚠️ AI analysis failed to return valid JSON: {e}. Raw (truncated): {text[:2000] if 'text' in locals() else 'NO RESPONSE'}")
-        return {}
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        st.error(f"⚠️ AI analysis failed: {e}")
-        return {}
+        return f"AI analysis failed: {e}"
 
-# -------------------------
-# Dashboard
-# -------------------------
+def render_ai_analysis(ai_text):
+    try:
+        data = json.loads(ai_text)
+    except Exception:
+        st.error("⚠️ AI returned unstructured response. Showing raw output:")
+        st.write(ai_text)
+        return
+
+    st.subheader("AI Investment Analysis")
+
+    st.markdown(f"**Overall Grade:** {safe_get(data, 'overall_grade')}")
+    st.markdown(f"**Recommendation:** {safe_get(data, 'recommendation')}")
+
+    st.markdown("**Investment Thesis**")
+    st.write(safe_get(data, "investment_thesis"))
+
+    st.markdown("**Financial Health**")
+    fh = safe_get(data, "financial_health", {})
+    if isinstance(fh, dict):
+        for k, v in fh.items():
+            st.write(f"- {k.replace('_',' ').title()}: {v}")
+
+    strengths = safe_get(data, "key_strengths", [])
+    if strengths:
+        st.markdown("**Key Strengths**")
+        for s in strengths:
+            st.write(f"- {s}")
+
+    risks = safe_get(data, "key_risks", [])
+    if risks:
+        st.markdown("**Key Risks**")
+        for r in risks:
+            st.write(f"- {r}")
+
+# --- Dashboard Rendering ---
 def render_dashboard():
-    st.set_page_config(page_title="Earnings Intelligence", page_icon="📊", layout="wide")
     st.title("📊 AI-Powered Earnings Intelligence Platform")
 
-    c1, c2 = st.columns([0.7, 0.3])
-    with c1:
-        ticker = st.text_input("Stock Ticker", value="AAPL", placeholder="AAPL, MSFT, GOOGL").strip().upper()
-    with c2:
-        quarters = st.selectbox("Quarters to analyze", [1,2,3,4], index=1)
+    ticker = st.text_input("Stock Ticker", "AAPL")
+    quarters = st.selectbox("Quarters to analyze", [1, 2, 4, 8], index=0)
+    if not ticker:
+        st.stop()
 
-    debug = st.checkbox("Show SEC debug logs", value=True)
+    if st.button("🔍 Analyze Earnings"):
+        sec_data = fetch_sec_earnings(ticker, quarters)
+        transcripts = []  # placeholder
+        analysts = []     # placeholder
+        market_data = fetch_market_data(ticker)
 
-    if st.button("🔍 Analyze Earnings", type="primary", use_container_width=True):
-        if not ticker:
-            st.warning("Please enter ticker symbol.")
-            st.stop()
+        st.header("Source Data Overview")
+        tabs = st.tabs(["SEC Filings", "Transcripts", "Analysts", "Market"])
 
-        with st.spinner("🔄 Collecting earnings intelligence..."):
-            sec_data, raw_responses = fetch_sec_earnings(ticker, quarters, debug=debug)
-            transcripts = fetch_earnings_transcripts(ticker, quarters)
-            analyst_data = fetch_analyst_sentiment(ticker)
-            market_data = fetch_market_data(ticker, days=90)
-
-        # Tabs
-        st.subheader("Source Data Overview")
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 SEC Filings", "🎙️ Transcripts", "📰 Analysts", "📈 Market"])
-
-        with tab1:
+        with tabs[0]:
             if sec_data:
                 df = pd.DataFrame(sec_data)
-                for col in ("revenue","net_income","eps"):
+                for col in ["revenue", "net_income", "eps"]:
                     if col in df.columns:
-                        df[col] = df[col].apply(lambda x: safe_format(x))
+                        df[col] = df[col].apply(
+                            lambda x: safe_format(x) if x is not None else "N/A"
+                        )
                 st.dataframe(df, use_container_width=True)
 
-                with st.expander("🔎 Show Raw SEC JSON (Debug)"):
-                    st.write("Raw converter responses (by filing date):")
-                    st.json(raw_responses)
+                # Plot revenue, net income, EPS
+                df_plot = pd.DataFrame(sec_data)
+                if not df_plot.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=df_plot["period"], y=df_plot["revenue"], name="Revenue"
+                    ))
+                    fig.add_trace(go.Bar(
+                        x=df_plot["period"], y=df_plot["net_income"], name="Net Income"
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=df_plot["period"], y=df_plot["eps"], name="EPS", yaxis="y2"
+                    ))
+                    fig.update_layout(
+                        title="Revenue & Net Income (bars) and EPS (line)",
+                        yaxis=dict(title="Amount (USD)"),
+                        yaxis2=dict(title="EPS", overlaying="y", side="right"),
+                        barmode="group",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
             else:
-                st.info("No SEC filing data available.")
+                st.info("No SEC filings available.")
 
-        with tab2:
-            if transcripts:
-                for t in transcripts:
-                    with st.expander(f"{t.get('quarter')} — {t.get('date')} ({t.get('source')})"):
-                        st.write("CEO comments:")
-                        for c in t.get("ceo_comments", []):
-                            st.write(f"- {c}")
-                        st.write("Key metrics:")
-                        for m in t.get("key_metrics_discussed", []):
-                            st.write(f"- {m}")
-            else:
-                st.info("No transcripts.")
-
-        with tab3:
-            if analyst_data:
-                for a in analyst_data:
-                    with st.expander(f"{a.get('firm')} — {a.get('rating')}"):
-                        st.write(a.get("headline"))
-                        for p in a.get("key_points", a.get("key_points", [])):
-                            st.write(f"- {p}")
-            else:
-                st.info("No analyst reports.")
-
-        with tab4:
-            if market_data:
-                # Key metrics
-                st.metric("Current Price", format_currency(market_data.get("current_price", 0)))
-                st.metric("30-Day Change", f"{market_data.get('price_change_30d', 0):.1f}%")
-                st.metric("P/E Ratio", f"{market_data.get('pe_ratio', 'N/A')}")
-                st.metric("Market Cap", format_currency(market_data.get("market_cap", 0)))
-
-                # Stock price chart (Plotly)
-                ph = market_data.get("price_history", [])
-                dates = market_data.get("dates", [])
-                if ph and dates and len(ph) == len(dates):
-                    df_price = pd.DataFrame({"date": pd.to_datetime(dates), "close": ph})
-                    fig_price = px.line(df_price, x="date", y="close", title=f"{ticker} - Last {len(ph)} Days Close")
-                    fig_price.update_yaxes(tickprefix="$")
-                    st.plotly_chart(fig_price, use_container_width=True)
-            else:
-                st.info("No market data.")
-
-        # Plotly charts for filings
-        numeric_rows = []
-        for f in sec_data:
-            numeric_rows.append({
-                "filed_at": f.get("filed_at"),
-                "period": f.get("period"),
-                "revenue": f.get("revenue"),
-                "net_income": f.get("net_income"),
-                "eps": f.get("eps")
-            })
-
-        if numeric_rows:
-            chart_df = pd.DataFrame(numeric_rows)
-            if "period" in chart_df.columns and chart_df["period"].notna().any():
-                chart_df["x"] = pd.to_datetime(chart_df["period"], errors="coerce")
-            else:
-                chart_df["x"] = pd.to_datetime(chart_df["filed_at"], errors="coerce")
-            chart_df = chart_df.sort_values("x")
-
-            # Revenue / Net Income combined figure
-            rev_df = chart_df.dropna(subset=["revenue","x"])[["x","revenue"]]
-            ni_df = chart_df.dropna(subset=["net_income","x"])[["x","net_income"]]
-            eps_df = chart_df.dropna(subset=["eps","x"])[["x","eps"]]
-
-            if not rev_df.empty or not ni_df.empty or not eps_df.empty:
+        with tabs[3]:
+            if not market_data.empty:
                 fig = go.Figure()
-                if not rev_df.empty:
-                    fig.add_trace(go.Bar(x=rev_df["x"], y=rev_df["revenue"], name="Revenue", yaxis="y1"))
-                if not ni_df.empty:
-                    fig.add_trace(go.Bar(x=ni_df["x"], y=ni_df["net_income"], name="Net Income", yaxis="y1"))
-                if not eps_df.empty:
-                    fig.add_trace(go.Line(x=eps_df["x"], y=eps_df["eps"], name="EPS", yaxis="y2", marker=dict(symbol="diamond")))
-                # axes
-                fig.update_layout(
-                    title="Revenue & Net Income (bars) and EPS (line)",
-                    xaxis=dict(title="Period"),
-                    yaxis=dict(title="Amount (USD)", tickprefix="$"),
-                    yaxis2=dict(title="EPS", overlaying="y", side="right")
-                )
+                fig.add_trace(go.Scatter(
+                    x=market_data.index, y=market_data["Close"], mode="lines", name="Close"
+                ))
+                fig.update_layout(title="Stock Price (Last 90 Days)")
                 st.plotly_chart(fig, use_container_width=True)
-
-        # AI analysis
-        st.markdown("---")
-        st.header("🤖 AI Investment Analysis")
-        with st.spinner("🧠 Generating comprehensive analysis..."):
-            analysis = analyze_earnings_with_ai(ticker, sec_data, transcripts, analyst_data, market_data)
-
-        if analysis:
-            if isinstance(analysis, dict):
-                # show top metrics if present
-                grade = analysis.get("overall_grade", "N/A")
-                rec = analysis.get("recommendation", "N/A")
-                st.markdown(f"**Overall Grade:** {grade}  \n**Recommendation:** {rec}")
-                st.json(analysis)
             else:
-                st.write("AI output (raw):")
-                st.write(analysis)
-        else:
-            st.warning("AI analysis could not be generated. Check raw SEC JSON & debug logs.")
+                st.info("No market data available.")
+
+        # --- AI Section ---
+        context = {
+            "sec_filings": sec_data,
+            "analyst_reports": analysts,
+            "transcripts": transcripts,
+        }
+        ai_text = analyze_with_ai(json.dumps(context))
+        render_ai_analysis(ai_text)
 
 if __name__ == "__main__":
     render_dashboard()
