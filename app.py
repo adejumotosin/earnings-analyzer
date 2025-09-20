@@ -46,19 +46,13 @@ def format_currency(value):
 # ====================================
 @st.cache_data(ttl=3600, show_spinner="📋 Fetching SEC filings...")
 def fetch_sec_earnings(ticker, quarters=4):
-    """
-    Fetch financial data from sec-api.io using the official XBRL-to-JSON API.
-    Priority:
-      1. xbrl-url
-      2. htm-url
-      3. accession-no
-    """
     filings_data = []
+    raw_responses = {}
 
     sec_api_key = st.secrets.get("SEC_API_KEY") or os.environ.get("SEC_API_KEY")
     if not sec_api_key:
         st.error("❌ Missing SEC API key. Please set it in your Streamlit secrets.")
-        return []
+        return [], {}
 
     query_url = "https://api.sec-api.io"
     payload = {
@@ -75,11 +69,11 @@ def fetch_sec_earnings(ticker, quarters=4):
         filings = query_response.json().get("filings", [])
     except requests.exceptions.RequestException as e:
         st.error(f"❌ Failed to fetch filing metadata: {e}")
-        return []
+        return [], {}
 
     if not filings:
         st.info(f"No 10-Q or 10-K filings found for {ticker}.")
-        return []
+        return [], {}
 
     for filing in filings:
         filing_date = filing.get("filedAt")
@@ -89,7 +83,6 @@ def fetch_sec_earnings(ticker, quarters=4):
         filing_xbrl = filing.get("linkToXbrl")
         filing_html = filing.get("linkToFilingDetails")
 
-        # Build candidate parameters
         candidates = []
         if filing_xbrl:
             candidates.append(("xbrl-url", filing_xbrl))
@@ -116,6 +109,7 @@ def fetch_sec_earnings(ticker, quarters=4):
                 )
                 resp.raise_for_status()
                 xbrl_data = resp.json()
+                raw_responses[filing_date] = xbrl_data
                 break
             except requests.exceptions.RequestException as e:
                 st.warning(
@@ -128,21 +122,36 @@ def fetch_sec_earnings(ticker, quarters=4):
             )
             continue
 
-        # Extract income statement
-        income_statements = (
-            xbrl_data.get("StatementsOfIncome")
-            or xbrl_data.get("incomeStatement")
-            or []
-        )
+        # Extract income statement safely
+        possible_keys = [
+            "StatementsOfIncome",
+            "incomeStatement",
+            "ComprehensiveIncomeStatement",
+            "StatementOfIncome",
+        ]
+        income_statements = None
+        for key in possible_keys:
+            if key in xbrl_data:
+                income_statements = xbrl_data[key]
+                break
+
         if not income_statements:
             st.warning(
-                f"⚠️ No income statement found in filing {form_type} {filing_date}"
+                f"⚠️ No income statement found in filing {form_type} {filing_date}. Keys available: {list(xbrl_data.keys())[:10]}"
             )
             continue
 
-        last_statement = income_statements[-1]
-        revenue = last_statement.get("Revenues") or last_statement.get(
-            "RevenueFromContractWithCustomerExcludingAssessedTax"
+        if isinstance(income_statements, list) and income_statements:
+            last_statement = income_statements[-1]
+        elif isinstance(income_statements, dict):
+            last_statement = income_statements
+        else:
+            st.warning(f"⚠️ Unexpected format for income statement in {form_type} {filing_date}")
+            continue
+
+        revenue = (
+            last_statement.get("Revenues")
+            or last_statement.get("RevenueFromContractWithCustomerExcludingAssessedTax")
         )
         net_income = last_statement.get("NetIncomeLoss")
         eps = last_statement.get("EarningsPerShareDiluted")
@@ -157,7 +166,7 @@ def fetch_sec_earnings(ticker, quarters=4):
             }
         )
 
-    return filings_data
+    return filings_data, raw_responses
 
 
 # =====================================================
@@ -316,7 +325,7 @@ def render_dashboard():
 
     if st.button("🔍 Analyze Earnings", type="primary", use_container_width=True):
         with st.spinner("🔄 Collecting data..."):
-            sec_data = fetch_sec_earnings(ticker, quarters)
+            sec_data, raw_responses = fetch_sec_earnings(ticker, quarters)
             transcripts = fetch_earnings_transcripts(ticker, quarters)
             analyst_data = fetch_analyst_sentiment(ticker)
             market_data = fetch_market_data(ticker)
@@ -333,6 +342,9 @@ def render_dashboard():
                     lambda x: format_currency(x) if x else "N/A"
                 )
                 st.dataframe(df, use_container_width=True)
+
+                with st.expander("🔎 Show Raw SEC JSON (Debug)"):
+                    st.json(raw_responses)
             else:
                 st.info("No SEC filings found")
 
