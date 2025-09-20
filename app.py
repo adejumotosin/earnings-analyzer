@@ -119,11 +119,10 @@ def safe_format(val: Any) -> str:
         return "N/A"
 
 # -------------------------
-# SEC XBRL -> JSON fetcher
+# SEC XBRL -> JSON fetcher - FIXED
 # -------------------------
 @st.cache_data(ttl=3600)
 def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> Tuple[List[Dict], Dict]:
-    # ... (No changes here, the original function is robust)
     filings_data: List[Dict] = []
     raw_responses: Dict[str, Any] = {}
 
@@ -132,7 +131,6 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
             st.warning("⚠️ Missing SEC_API_KEY; cannot fetch SEC filings.")
         return [], {}
 
-    # Query sec-api.io for filings
     query_url = "https://api.sec-api.io"
     payload = {
         "query": f"ticker:{ticker} AND formType:(\"10-Q\" OR \"10-K\")",
@@ -166,11 +164,9 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
         link_html = filing.get("linkToFilingDetails")
         doc_files = filing.get("documentFormatFiles") or []
 
-        # Build candidate param list following docs: xbrl-url -> htm-url -> accession-no
         candidates = []
         if link_xbrl:
             candidates.append(("xbrl-url", link_xbrl))
-        # Extract any .xml in documentFormatFiles
         for doc in doc_files:
             url = doc.get("documentUrl") or doc.get("downloadUrl")
             if url and isinstance(url, str) and url.lower().endswith(".xml"):
@@ -180,11 +176,6 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
             candidates.append(("htm-url", link_html))
         if accession:
             candidates.append(("accession-no", accession))
-
-        if debug:
-            st.write(f"🔎 DEBUG: Filing {form_type} filedAt={filed_at} candidates:")
-            for k, v in candidates:
-                st.write(f"  • {k}: {v}")
 
         xbrl_json = None
         used_param = None
@@ -210,96 +201,35 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
                 st.warning(f"⚠️ No XBRL JSON for filing {form_type} at {filed_at}.")
             continue
 
-        # Look for income statement data under a number of possible keys
-        possible_keys = ["StatementsOfIncome", "StatementsOfOperations", "incomeStatement", "IncomeStatements", "StatementOfIncome", "ComprehensiveIncomeStatement"]
-        income_block = None
-        for key in possible_keys:
-            if key in xbrl_json:
-                income_block = xbrl_json[key]
+        # --- FIX: Use a more robust search for specific XBRL concepts ---
+        facts = xbrl_json.get("facts", {})
+        revenue_keys = ["us-gaap:Revenues", "us-gaap:SalesRevenueNet", "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"]
+        net_income_keys = ["us-gaap:NetIncomeLoss", "us-gaap:ProfitLoss", "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic"]
+        eps_keys = ["us-gaap:EarningsPerShareDiluted", "us-gaap:EarningsPerShareBasic"]
+
+        revenue, net_income, eps_val = None, None, None
+        
+        # Search for each metric using a prioritized list of keys
+        for key in revenue_keys:
+            if key in facts:
+                revenue = extract_fact_value(facts[key])
+                break
+        
+        for key in net_income_keys:
+            if key in facts:
+                net_income = extract_fact_value(facts[key])
                 break
 
-        # If not found, try 'facts' as last resort
-        if income_block is None:
-            facts = xbrl_json.get("facts") or {}
-            rev = None
-            ni = None
-            eps_val = None
-            for concept_key, concept_value in facts.items():
-                low = concept_key.lower()
-                if "revenue" in low and rev is None:
-                    rev = extract_fact_value(concept_value)
-                if "netincome" in low and ni is None:
-                    ni = extract_fact_value(concept_value)
-                if ("earningspershare" in low or "eps" in low) and eps_val is None:
-                    eps_val = extract_fact_value(concept_value)
-            filings_data.append({
-                "filed_at": filed_at,
-                "period": filing.get("periodOfReport"),
-                "type": form_type,
-                "revenue": rev,
-                "eps": eps_val,
-                "net_income": ni,
-                "accession_number": accession,
-                "xbrl_source_used": used_param
-            })
-            continue
-
-        # Normalize income_block
-        chosen_statement = None
-        if isinstance(income_block, list) and len(income_block) > 0:
-            for item in reversed(income_block):
-                if isinstance(item, dict) and any(k.lower() in map(str.lower, item.keys()) for k in ("Revenues", "NetIncomeLoss", "EarningsPerShareDiluted")):
-                    chosen_statement = item
-                    break
-            if chosen_statement is None:
-                chosen_statement = income_block[-1]
-        elif isinstance(income_block, dict):
-            chosen_statement = income_block
-        else:
+        for key in eps_keys:
+            if key in facts:
+                eps_val = extract_fact_value(facts[key])
+                break
+        
+        # --- FIX: Add a critical sanity check to prevent impossible data ---
+        if revenue is not None and net_income is not None and net_income > revenue:
             if debug:
-                st.warning(f"⚠️ Unexpected format for income block in filing {filed_at}: {type(income_block)}")
-            continue
-
-        revenue_raw = None
-        net_income_raw = None
-        eps_raw = None
-
-        if isinstance(chosen_statement, dict):
-            for key in ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "TotalRevenue"):
-                if key in chosen_statement and revenue_raw is None:
-                    revenue_raw = chosen_statement.get(key)
-            for key in ("NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"):
-                if key in chosen_statement and net_income_raw is None:
-                    net_income_raw = chosen_statement.get(key)
-            for key in ("EarningsPerShareDiluted", "EarningsPerShareBasic", "EarningsPerShare"):
-                if key in chosen_statement and eps_raw is None:
-                    eps_raw = chosen_statement.get(key)
-
-            if revenue_raw is None or net_income_raw is None or eps_raw is None:
-                for k, v in chosen_statement.items():
-                    low = k.lower()
-                    if revenue_raw is None and ("revenue" in low or "sales" in low):
-                        revenue_raw = revenue_raw or v
-                    if net_income_raw is None and ("netincome" in low or "profit" in low):
-                        net_income_raw = net_income_raw or v
-                    if eps_raw is None and ("earningspershare" in low or "eps" in low):
-                        eps_raw = eps_raw or v
-
-        if isinstance(chosen_statement, list):
-            for fact in reversed(chosen_statement):
-                concept = fact.get("concept") or ""
-                val = fact.get("value") if isinstance(fact, dict) else fact
-                low = concept.lower()
-                if revenue_raw is None and ("revenue" in low or "sales" in low):
-                    revenue_raw = val
-                if net_income_raw is None and ("netincome" in low or "profitloss" in low or "profit" in low):
-                    net_income_raw = val
-                if eps_raw is None and ("earningspershare" in low or "eps" in low):
-                    eps_raw = val
-
-        revenue = extract_fact_value(revenue_raw)
-        net_income = extract_fact_value(net_income_raw)
-        eps_val = extract_fact_value(eps_raw)
+                st.warning(f"⚠️ DEBUG: Detected impossible Net Income > Revenue for filing {filed_at}. Discarding Net Income value.")
+            net_income = None
 
         filings_data.append({
             "filed_at": filed_at,
@@ -311,7 +241,6 @@ def fetch_sec_earnings(ticker: str, quarters: int = 4, debug: bool = False) -> T
             "accession_number": accession,
             "xbrl_source_used": used_param
         })
-
     return filings_data, raw_responses
 
 # -------------------------
@@ -321,7 +250,7 @@ MOCK_DATA = {
     "AAPL": {
         "transcripts": [
             {
-                "date": "2024-10-30", "quarter": "Q3 2024", "source": "SeekingAlpha",
+                "date": "2024-08-01", "quarter": "Q3 2024", "source": "SeekingAlpha",
                 "ceo_comments": [
                     "We delivered strong results this quarter with revenue growth of 8% year-over-year.",
                     "Our new product line is gaining significant traction in the market.",
@@ -331,7 +260,7 @@ MOCK_DATA = {
         ],
         "analysts": [
             {
-                "date": "2024-11-01", "firm": "Goldman Sachs", "rating": "Buy", "price_target": 180,
+                "date": "2024-08-02", "firm": "Goldman Sachs", "rating": "Buy", "price_target": 180,
                 "headline": "Strong Q3 results support positive outlook",
                 "key_points": ["Revenue beat expectations by 3%", "New product line success."]
             }
@@ -371,7 +300,6 @@ def fetch_analyst_sentiment(ticker: str):
 # -------------------------
 @st.cache_data(ttl=300)
 def fetch_market_data(ticker: str, days: int = 90):
-    # ... (No changes here, the original function is robust)
     try:
         stock = yf.Ticker(ticker)
         info = stock.info if hasattr(stock, "info") else {}
@@ -397,7 +325,7 @@ def fetch_market_data(ticker: str, days: int = 90):
         return {}
 
 # -------------------------
-# AI Analysis (Gemini) - IMPROVEMENT: Refine Prompt
+# AI Analysis (Gemini) - IMPROVED PROMPT
 # -------------------------
 @st.cache_data(ttl=7200)
 def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: List[Dict], analyst_reports: List[Dict], market_data: Dict):
@@ -415,7 +343,7 @@ def analyze_earnings_with_ai(ticker: str, sec_filings: List[Dict], transcripts: 
 
         prompt = f"""
 You are a professional financial analyst. Based on the data below, produce a single, valid JSON object with the following keys.
-Ensure all values are populated based on the data provided.
+Only use information provided in the JSON data. Do not use specific numbers or percentages unless they are present in the provided JSON data.
 
 1.  overall_grade: A single letter grade from A to F.
 2.  recommendation: A single word: "Buy", "Hold", or "Sell".
@@ -491,7 +419,6 @@ def display_analysis(analysis: Dict):
             for risk in analysis.get("key_risks", []):
                 st.markdown(f"- {risk}")
 
-    # Add other sections from the JSON if they exist
     with st.expander("Show Detailed AI Output"):
         st.json(analysis)
 
@@ -507,14 +434,13 @@ def render_dashboard():
     with c2:
         quarters = st.selectbox("Quarters to analyze", [1,2,3,4], index=1)
 
-    debug = st.checkbox("Show SEC debug logs", value=True)
+    debug = st.checkbox("Show SEC debug logs", value=False)
 
     if st.button("🔍 Analyze Earnings", type="primary", use_container_width=True):
         if not ticker:
             st.warning("Please enter ticker symbol.")
             st.stop()
 
-        # IMPROVEMENT: Add more granular spinner messages
         with st.spinner("🔄 Collecting SEC filings..."):
             sec_data, raw_responses = fetch_sec_earnings(ticker, quarters, debug=debug)
         
@@ -586,7 +512,6 @@ def render_dashboard():
             else:
                 st.info("No market data.")
 
-        # Plotly charts for filings
         numeric_rows = []
         for f in sec_data:
             numeric_rows.append({
@@ -626,7 +551,6 @@ def render_dashboard():
                         x=eps_df["x"], y=eps_df["eps"], name="EPS", yaxis="y2", marker=dict(symbol="diamond"),
                         hovertemplate='EPS: %{y:.2f}<extra></extra>'
                     ))
-                # axes
                 fig.update_layout(
                     title="Revenue & Net Income (bars) and EPS (line)",
                     xaxis=dict(title="Period"),
@@ -635,12 +559,10 @@ def render_dashboard():
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-        # AI analysis
         st.markdown("---")
         with st.spinner("🧠 Generating comprehensive analysis..."):
             analysis = analyze_earnings_with_ai(ticker, sec_data, transcripts, analyst_data, market_data)
 
-        # IMPROVEMENT: Use the new display function
         display_analysis(analysis)
 
 if __name__ == "__main__":
