@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.json
+!package.json
+!tsconfig.json
+
+# Local model / vector state
+chroma/
+.chroma/
+
+# Tooling
+.pytest_cache/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
