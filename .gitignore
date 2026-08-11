@@ -9,9 +9,9 @@ venv/
 .env.*
 !.env.example
 .streamlit/secrets.toml
-*.json
-!package.json
-!tsconfig.json
+credentials.json
+google-credentials.json
+service-account*.json
 
 # Local model / vector state
 chroma/
